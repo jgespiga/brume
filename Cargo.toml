@@ -1,0 +1,13 @@
+[package]
+name = "brume"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+egui = "0.36.2"
+glam = "0.33.11"
+las = { version = "0.11.1", features = ["laz-parallel"] }
+
+[profile.dev.package."*"]
+opt-level = 2

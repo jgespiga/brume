@@ -1,37 +1,12 @@
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use glam::DVec3;
 
-/// Avoid reading the whole file at once. Instead, we
-/// will read batches of aprox 1 million points.
-const BATCH_SIZE: u64 = 1 << 20;
+use crate::loader::read_file;
 
-fn read_file(reader: &mut las::Reader) -> Result<las::PointData> {
-    let start = Instant::now();
-
-    let mut batch = reader.read_points(BATCH_SIZE)?;
-    let mut total: u64 = 0;
-    let mut batches: u32 = 0;
-
-    while !batch.is_empty() {
-        total += batch.len() as u64;
-        batches += 1;
-
-        let read = reader.fill_points(BATCH_SIZE, &mut batch)?;
-        if read == 0 {
-            break;
-        }
-    }
-
-    let elapsed = start.elapsed();
-    println!("Time -> {:.2}", elapsed.as_secs_f64());
-    println!(
-        "Points read -> {} ; Number of batches -> {}",
-        total, batches
-    );
-
-    Ok(batch)
-}
+mod cloud;
+mod loader;
 
 fn main() -> Result<()> {
     let path = std::env::args().nth(1).context("usage: brume <file.laz>")?;
@@ -41,9 +16,9 @@ fn main() -> Result<()> {
     let header = reader.header();
 
     let n_points = header.number_of_points();
-    println!("{}", n_points);
+    println!("Number of points -> {}", n_points);
 
-    let batch = read_file(&mut reader)?;
+    let _ = read_file(&mut reader)?;
 
     Ok(())
 }

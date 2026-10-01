@@ -14,10 +14,21 @@ use glam::DVec3;
 pub(crate) struct PointChunk {
     /// [pos, pos, pos]
     pub positions: Vec<[f32; 3]>,
+    pub classes: Vec<u8>,
+}
+
+impl PointChunk {
+    pub fn len(&self) -> usize {
+        self.positions.len()
+    }
 }
 
 /// Representation of a cloud of points and its origin.
 pub(crate) struct Cloud {
     pub origin: DVec3,
     pub chunks: Vec<PointChunk>,
+}
+
+pub(crate) struct Stats {
+    pub class_counts: [u64; 256],
 }

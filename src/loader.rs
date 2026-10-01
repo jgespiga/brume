@@ -1,6 +1,7 @@
-use std::time::Instant;
+use std::{path::Path, time::Instant};
 
 use anyhow::{Context, Result};
+use egui::epaint::tessellator;
 use glam::{DVec3, Vec3};
 
 use crate::cloud::{Cloud, PointChunk};
@@ -9,8 +10,13 @@ use crate::cloud::{Cloud, PointChunk};
 /// will read batches of aprox 1 million points.
 const BATCH_SIZE: u64 = 1 << 20;
 
-pub(crate) fn read_file(reader: &mut las::Reader) -> Result<(Cloud)> {
+pub(crate) fn load(path: &Path) -> Result<Cloud> {
     let start = Instant::now();
+
+    // Create las reader.
+    let mut reader = las::Reader::from_path(path)?;
+
+    println!("Number of points -> {}", reader.header().number_of_points());
 
     let mut batch = reader.read_points(BATCH_SIZE)?;
 
@@ -21,6 +27,7 @@ pub(crate) fn read_file(reader: &mut las::Reader) -> Result<(Cloud)> {
 
     let origin = ((min + max) * 0.5).round();
 
+    // Calculate the number of batches we are going to process.
     let n_points = reader.header().number_of_points();
     let n_batches = n_points.div_ceil(BATCH_SIZE) as usize;
 
@@ -68,7 +75,7 @@ pub(crate) fn read_file(reader: &mut las::Reader) -> Result<(Cloud)> {
         total, batches
     );
 
-    println!("Origin (UTM):    {:.2?}", origin);
+    println!("Origin (UTM):    {:.2?}", cloud.origin);
     println!("Local min (f32): {:.2?}", local_min);
     println!("Local max (f32): {:.2?}", local_max);
 

@@ -31,7 +31,18 @@ pub(crate) fn load(path: &Path) -> Result<(Cloud, Stats)> {
     let start = Instant::now();
 
     // Create las reader.
-    let mut reader = las::Reader::from_path(path)?;
+    //let mut reader = las::Reader::from_path(path)?;
+    use las::{ReaderOptions, reader::LazParallelism};
+    use std::{fs::File, io::BufReader};
+    let parallel = true;
+    let parallelism = if parallel {
+        LazParallelism::Yes
+    } else {
+        LazParallelism::No
+    };
+    let options = ReaderOptions::default().with_laz_parallelism(parallelism);
+    let file = BufReader::new(File::open(path)?);
+    let mut reader = las::Reader::with_options(file, options)?;
     let n_points = reader.header().number_of_points();
 
     // Calculate the origin based on the header bounds.

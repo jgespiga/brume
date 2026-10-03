@@ -58,6 +58,8 @@ pub(crate) fn load(path: &Path) -> Result<(Cloud, Stats)> {
         color_depth: ColorDepth::None,
         local_min: Vec3::splat(f32::INFINITY),
         local_max: Vec3::splat(f32::NEG_INFINITY),
+        intensity_min: u16::MAX,
+        intensity_max: u16::MIN,
         elapsed: Duration::ZERO,
     };
 
@@ -69,6 +71,7 @@ pub(crate) fn load(path: &Path) -> Result<(Cloud, Stats)> {
             positions: Vec::with_capacity(batch.len()),
             classes: Vec::with_capacity(batch.len()),
             colors: Vec::with_capacity(batch.len()),
+            intensity: Vec::with_capacity(batch.len()),
         };
 
         for ((x, y), z) in batch.x().zip(batch.y()).zip(batch.z()) {
@@ -84,6 +87,12 @@ pub(crate) fn load(path: &Path) -> Result<(Cloud, Stats)> {
             let class = class & class_mask;
             stats.class_counts[usize::from(class)] += 1;
             chunk.classes.push(class);
+        }
+
+        for intensity in batch.intensity() {
+            stats.intensity_min = stats.intensity_min.min(intensity);
+            stats.intensity_max = stats.intensity_max.max(intensity);
+            chunk.intensity.push(intensity);
         }
 
         match (batch.rgb(), stats.color_depth) {
@@ -108,6 +117,7 @@ pub(crate) fn load(path: &Path) -> Result<(Cloud, Stats)> {
 
         debug_assert_eq!(chunk.classes.len(), chunk.len());
         debug_assert_eq!(chunk.colors.len(), chunk.len());
+        debug_assert_eq!(chunk.intensity.len(), chunk.len());
 
         cloud.chunks.push(chunk);
 

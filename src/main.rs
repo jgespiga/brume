@@ -42,6 +42,10 @@ fn log_stats(cloud: &Cloud, stats: &Stats) {
     println!("Local min (f32): {:.2?}", stats.local_min);
     println!("Local max (f32): {:.2?}", stats.local_max);
     println!("Color depth: {:?}", stats.color_depth);
+    println!(
+        "Intensity: {} - {}\n",
+        stats.intensity_min, stats.intensity_max
+    );
 
     let mut present: Vec<(u8, u64)> = stats
         .class_counts
@@ -74,7 +78,7 @@ fn log_stats(cloud: &Cloud, stats: &Stats) {
 
     if n > 0 {
         let avg = sum.map(|s| s / n);
-        println!("Average color:   rgb({}, {}, {})", avg[0], avg[1], avg[2]);
+        println!("\nAverage color:   rgb({}, {}, {})", avg[0], avg[1], avg[2]);
     }
 }
 

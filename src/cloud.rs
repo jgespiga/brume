@@ -20,6 +20,7 @@ pub(crate) struct PointChunk {
     pub positions: Vec<[f32; 3]>,
     pub classes: Vec<u8>,
     pub colors: Vec<[u8; 4]>,
+    pub intensity: Vec<u16>,
 }
 
 impl PointChunk {
@@ -45,6 +46,8 @@ pub(crate) struct Stats {
     pub color_depth: ColorDepth,
     pub local_min: Vec3,
     pub local_max: Vec3,
+    pub intensity_min: u16,
+    pub intensity_max: u16,
     pub elapsed: Duration,
 }
 

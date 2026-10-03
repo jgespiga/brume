@@ -8,11 +8,12 @@ use crate::{
     loader::load,
 };
 
+mod app;
 mod cloud;
 mod loader;
 
 /// Map each class code with its actual class name.
-fn class_name(code: u8) -> &'static str {
+pub fn class_name(code: u8) -> &'static str {
     match code {
         1 => "Unclassified",
         2 => "Ground",
@@ -89,6 +90,14 @@ fn main() -> Result<()> {
     let (cloud, stats) = load(path)?;
 
     log_stats(&cloud, &stats);
+
+    let options = eframe::NativeOptions::default();
+    eframe::run_native(
+        "Brume",
+        options,
+        Box::new(|_cc| Ok(Box::new(app::Brume::new(cloud, stats)))),
+    )
+    .map_err(|e| anyhow::anyhow!("viewer error: {e}"))?;
 
     Ok(())
 }

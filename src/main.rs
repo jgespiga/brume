@@ -1,40 +1,17 @@
-use std::time::Instant;
-
 use anyhow::{Context, Result};
-use glam::DVec3;
 
 use crate::{
+    app::Brume,
     cloud::{Cloud, Stats},
     loader::load,
+    report::{ClassRow, average_color, class_rows},
 };
 
 mod app;
 mod cloud;
 mod loader;
-
-/// Map each class code with its actual class name.
-pub fn class_name(code: u8) -> &'static str {
-    match code {
-        1 => "Unclassified",
-        2 => "Ground",
-        3 => "Low vegetation",
-        4 => "Medium vegetation",
-        5 => "High vegetation",
-        6 => "Building",
-        7 => "Noise",
-        9 => "Water",
-        12 => "Overlap",
-        14 => "Power line",
-        15 => "Transmission tower",
-        17 => "Bridge",
-        64 => "Vehicle",
-        65 => "Wall",
-        67 => "Solar panel",
-        68 => "Wind turbine",
-        70 => "Antenna",
-        _ => "Other",
-    }
-}
+mod render;
+mod report;
 
 fn log_stats(cloud: &Cloud, stats: &Stats) {
     println!("Time: {:.2}", stats.elapsed.as_secs_f64());
@@ -48,37 +25,17 @@ fn log_stats(cloud: &Cloud, stats: &Stats) {
         stats.intensity_min, stats.intensity_max
     );
 
-    let mut present: Vec<(u8, u64)> = stats
-        .class_counts
-        .iter()
-        .enumerate()
-        .filter(|&(_, &count)| count > 0)
-        .map(|(code, &count)| (code as u8, count))
-        .collect();
-    present.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
+    for row in class_rows(stats) {
+        let ClassRow {
+            code,
+            name,
+            count,
+            percent,
+        } = row;
 
-    let total = stats.points as f64;
-
-    for (code, count) in present {
-        let name = class_name(code);
-        let pct = 100.0 * count as f64 / total;
-        println!("{code:>3}  {name:<20} {count:>10}  {pct:>5.1}%");
+        println!("{code:>3}  {name:<20} {count:>10}  {percent:>5.1}%");
     }
-
-    let mut sum = [0u64; 3];
-    let mut n: u64 = 0;
-
-    for chunk in &cloud.chunks {
-        for color in &chunk.colors {
-            sum[0] += u64::from(color[0]);
-            sum[1] += u64::from(color[1]);
-            sum[2] += u64::from(color[2]);
-            n += 1;
-        }
-    }
-
-    if n > 0 {
-        let avg = sum.map(|s| s / n);
+    if let Some(avg) = average_color(cloud) {
         println!("\nAverage color:   rgb({}, {}, {})", avg[0], avg[1], avg[2]);
     }
 }
@@ -95,7 +52,10 @@ fn main() -> Result<()> {
     eframe::run_native(
         "Brume",
         options,
-        Box::new(|_cc| Ok(Box::new(app::Brume::new(cloud, stats)))),
+        Box::new(|cc| {
+            let app = Brume::new(cc, cloud, stats).ok_or("Brume needs eframe's wgpu backend")?;
+            Ok(Box::new(app))
+        }),
     )
     .map_err(|e| anyhow::anyhow!("viewer error: {e}"))?;
 

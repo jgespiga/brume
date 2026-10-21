@@ -49,7 +49,10 @@ fn main() -> Result<()> {
 
     log_stats(&cloud, &stats);
 
-    let options = eframe::NativeOptions::default();
+    let options = eframe::NativeOptions {
+        depth_buffer: render::DEPTH_BITS,
+        ..Default::default()
+    };
     eframe::run_native(
         "Brume",
         options,

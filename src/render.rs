@@ -8,6 +8,9 @@ use glam::Mat4;
 
 use crate::cloud::Cloud;
 
+/// Bits of depth buffer requested from `eframe`. The pipeline must use the same format.
+pub const DEPTH_BITS: u8 = 24;
+
 /// GPU resources for drawing points.
 ///
 /// Stored in egui's renderer, not in the app.
@@ -89,6 +92,8 @@ impl PointRenderer {
             }],
         });
 
+        let depth_format = egui_wgpu::depth_format_from_bits(DEPTH_BITS, 0);
+
         // The pipeline: shaders + fixed settings.
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("points"),
@@ -112,7 +117,13 @@ impl PointRenderer {
                 topology: wgpu::PrimitiveTopology::PointList,
                 ..Default::default()
             },
-            depth_stencil: None,
+            depth_stencil: depth_format.map(|format| wgpu::DepthStencilState {
+                format,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
             cache: None,

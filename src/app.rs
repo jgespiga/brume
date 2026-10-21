@@ -16,7 +16,7 @@ pub struct Brume {
 impl Brume {
     pub fn new(cc: &eframe::CreationContext<'_>, cloud: Cloud, stats: Stats) -> Option<Self> {
         let render_state = cc.wgpu_render_state.as_ref()?;
-        PointRenderer::register(render_state);
+        PointRenderer::register(render_state, &cloud);
 
         let class_rows = class_rows(&stats);
         let average_color = average_color(&cloud);

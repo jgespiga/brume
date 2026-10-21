@@ -1,24 +1,19 @@
+struct VertexIn {
+    @location(0) position: vec3<f32>,
+    @location(1) color: vec4<f32>,
+};
+
 struct VertexOut {
-    @builtin(position) position: vec4<f32>,
+    @builtin(position) clip: vec4<f32>,
     @location(0) color: vec4<f32>,
 };
 
 @vertex
-fn vs_main(@builtin(vertex_index) i: u32) -> VertexOut {
-    var positions = array<vec2<f32>, 3>(
-        vec2(0.0, 0.5),
-        vec2(-0.5, -0.5),
-        vec2(0.5, -0.5),
-    );
-    var colors = array<vec3<f32>, 3>(
-        vec3(1.0, 0.0, 0.0),
-        vec3(0.0, 1.0, 0.0),
-        vec3(0.0, 0.0, 1.0),
-    );
-
+fn vs_main(in: VertexIn) -> VertexOut {
     var out: VertexOut;
-    out.position = vec4(positions[i], 0.0, 1.0);
-    out.color = vec4(colors[i], 1.0);
+    // Fixed top-down view: local metres (±500) map to clip space (±1).
+    out.clip = vec4(in.position.xy / 500.0, 0.5, 1.0);
+    out.color = in.color;
     return out;
 }
 

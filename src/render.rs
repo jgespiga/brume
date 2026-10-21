@@ -1,6 +1,10 @@
+use std::num::NonZeroU64;
+
 use eframe::egui;
 use eframe::egui_wgpu::{self, wgpu};
 use eframe::wgpu::util::DeviceExt;
+use eframe::wgpu::{BindGroup, Buffer};
+use glam::Mat4;
 
 use crate::cloud::Cloud;
 
@@ -10,6 +14,8 @@ use crate::cloud::Cloud;
 pub struct PointRenderer {
     pipeline: wgpu::RenderPipeline,
     chunks: Vec<ChunkBuffers>,
+    uniform_buffer: Buffer,
+    bind_group: BindGroup,
 }
 
 /// One chunk's data on the GPU.
@@ -45,11 +51,49 @@ impl PointRenderer {
             }),
         ];
 
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("camera"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    // one mat4x4<f32>
+                    min_binding_size: NonZeroU64::new(64),
+                },
+                count: None,
+            }],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("points"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+
+        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("camera"),
+            contents: bytemuck::cast_slice(&[0.0f32; 16]),
+            // `COPY_DST` allows writing to the buffer from the CPU every frame which
+            // `UNIFORM` alone does not.
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("camera"),
+            layout: &bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
+        });
+
         // The pipeline: shaders + fixed settings.
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("points"),
             // derived from the shader; no inputs yet
-            layout: None,
+            layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
@@ -98,14 +142,39 @@ impl PointRenderer {
             .renderer
             .write()
             .callback_resources
-            .insert(PointRenderer { pipeline, chunks });
+            .insert(PointRenderer {
+                pipeline,
+                chunks,
+                uniform_buffer,
+                bind_group,
+            });
     }
 }
 
 /// Attached to a rectangle in the UI; egui calls `paint` each frame.
-pub struct PointsCallback;
+pub struct PointsCallback {
+    pub view_proj: Mat4,
+}
 
 impl egui_wgpu::CallbackTrait for PointsCallback {
+    fn prepare(
+        &self,
+        _device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        _screen_descriptor: &egui_wgpu::ScreenDescriptor,
+        _egui_encoder: &mut wgpu::CommandEncoder,
+        resources: &mut egui_wgpu::CallbackResources,
+    ) -> Vec<wgpu::CommandBuffer> {
+        if let Some(renderer) = resources.get::<PointRenderer>() {
+            queue.write_buffer(
+                &renderer.uniform_buffer,
+                0,
+                bytemuck::cast_slice(&self.view_proj.to_cols_array()),
+            );
+        }
+        Vec::new()
+    }
+
     fn paint(
         &self,
         _info: egui::PaintCallbackInfo,
@@ -117,6 +186,7 @@ impl egui_wgpu::CallbackTrait for PointsCallback {
         };
 
         render_pass.set_pipeline(&renderer.pipeline);
+        render_pass.set_bind_group(0, &renderer.bind_group, &[]);
         for chunk in &renderer.chunks {
             render_pass.set_vertex_buffer(0, chunk.positions.slice(..));
             render_pass.set_vertex_buffer(1, chunk.colors.slice(..));

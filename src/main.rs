@@ -8,6 +8,7 @@ use crate::{
 };
 
 mod app;
+mod camera;
 mod cloud;
 mod loader;
 mod render;

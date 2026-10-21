@@ -1,6 +1,7 @@
 use eframe::{egui, egui_wgpu};
 
 use crate::{
+    camera::OrbitCamera,
     cloud::{Cloud, Stats},
     render::{PointRenderer, PointsCallback},
     report::{ClassRow, average_color, class_rows},
@@ -11,6 +12,7 @@ pub struct Brume {
     stats: Stats,
     class_rows: Vec<ClassRow>,
     average_color: Option<[u64; 3]>,
+    camera: OrbitCamera,
 }
 
 impl Brume {
@@ -26,6 +28,7 @@ impl Brume {
             stats,
             class_rows,
             average_color,
+            camera: OrbitCamera::new(glam::Vec3::ZERO, 1_500.0),
         })
     }
 
@@ -66,11 +69,22 @@ impl eframe::App for Brume {
         egui::Panel::left("stats_panel").show(ui, |ui| self.report_ui(ui));
 
         egui::CentralPanel::default().show(ui, |ui| {
-            let (rect, _response) =
-                ui.allocate_exact_size(ui.available_size(), egui::Sense::drag());
+            let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::drag());
+
+            if response.dragged() {
+                let delta = response.drag_delta();
+                self.camera.orbit(delta.x, delta.y);
+            }
+
+            if response.hovered() {
+                let scroll = ui.input(|input| input.smooth_scroll_delta.y);
+                self.camera.zoom(scroll);
+            }
+
+            let view_proj = self.camera.view_proj(rect.width() / rect.height());
             ui.painter().add(egui_wgpu::Callback::new_paint_callback(
                 rect,
-                PointsCallback,
+                PointsCallback { view_proj },
             ));
         });
     }

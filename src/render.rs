@@ -1,5 +1,6 @@
 use std::num::NonZeroU64;
 
+use bytemuck::{Pod, Zeroable};
 use eframe::egui;
 use eframe::egui_wgpu::{self, wgpu};
 use eframe::wgpu::util::DeviceExt;
@@ -28,6 +29,16 @@ struct ChunkBuffers {
     len: u32,
 }
 
+/// Must match `struct Camera` in points.wgsl byte for byte (80 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct CameraUniform {
+    view_proj: [[f32; 4]; 4],
+    viewport: [f32; 2],
+    point_size: f32,
+    _padding: f32,
+}
+
 impl PointRenderer {
     /// Creates the GPU resources once and hands them to egui's renderer.
     pub fn register(render_state: &egui_wgpu::RenderState, cloud: &Cloud) {
@@ -44,12 +55,12 @@ impl PointRenderer {
         let vertex_layouts = [
             Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress, // 12
-                step_mode: wgpu::VertexStepMode::Vertex,
+                step_mode: wgpu::VertexStepMode::Instance,
                 attributes: &wgpu::vertex_attr_array![0 => Float32x3],
             }),
             Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<[u8; 4]>() as wgpu::BufferAddress, // 4
-                step_mode: wgpu::VertexStepMode::Vertex,
+                step_mode: wgpu::VertexStepMode::Instance,
                 attributes: &wgpu::vertex_attr_array![1 => Unorm8x4],
             }),
         ];
@@ -62,8 +73,7 @@ impl PointRenderer {
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
-                    // one mat4x4<f32>
-                    min_binding_size: NonZeroU64::new(64),
+                    min_binding_size: NonZeroU64::new(std::mem::size_of::<CameraUniform>() as u64),
                 },
                 count: None,
             }],
@@ -77,7 +87,7 @@ impl PointRenderer {
 
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("camera"),
-            contents: bytemuck::cast_slice(&[0.0f32; 16]),
+            contents: bytemuck::bytes_of(&CameraUniform::zeroed()),
             // `COPY_DST` allows writing to the buffer from the CPU every frame which
             // `UNIFORM` alone does not.
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
@@ -97,7 +107,6 @@ impl PointRenderer {
         // The pipeline: shaders + fixed settings.
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("points"),
-            // derived from the shader; no inputs yet
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -114,7 +123,7 @@ impl PointRenderer {
             }),
 
             primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::PointList,
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
                 ..Default::default()
             },
             depth_stencil: depth_format.map(|format| wgpu::DepthStencilState {
@@ -165,6 +174,8 @@ impl PointRenderer {
 /// Attached to a rectangle in the UI; egui calls `paint` each frame.
 pub struct PointsCallback {
     pub view_proj: Mat4,
+    pub viewport: [f32; 2],
+    pub point_size: f32,
 }
 
 impl egui_wgpu::CallbackTrait for PointsCallback {
@@ -176,12 +187,15 @@ impl egui_wgpu::CallbackTrait for PointsCallback {
         _egui_encoder: &mut wgpu::CommandEncoder,
         resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
+        let uniform = CameraUniform {
+            view_proj: self.view_proj.to_cols_array_2d(),
+            viewport: self.viewport,
+            point_size: self.point_size,
+            _padding: 0.0,
+        };
+
         if let Some(renderer) = resources.get::<PointRenderer>() {
-            queue.write_buffer(
-                &renderer.uniform_buffer,
-                0,
-                bytemuck::cast_slice(&self.view_proj.to_cols_array()),
-            );
+            queue.write_buffer(&renderer.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
         }
         Vec::new()
     }
@@ -201,7 +215,7 @@ impl egui_wgpu::CallbackTrait for PointsCallback {
         for chunk in &renderer.chunks {
             render_pass.set_vertex_buffer(0, chunk.positions.slice(..));
             render_pass.set_vertex_buffer(1, chunk.colors.slice(..));
-            render_pass.draw(0..chunk.len, 0..1);
+            render_pass.draw(0..4, 0..chunk.len);
         }
     }
 }

@@ -13,6 +13,7 @@ pub struct Brume {
     class_rows: Vec<ClassRow>,
     average_color: Option<[u64; 3]>,
     camera: OrbitCamera,
+    point_size: f32,
 }
 
 impl Brume {
@@ -29,6 +30,7 @@ impl Brume {
             class_rows,
             average_color,
             camera: OrbitCamera::new(glam::Vec3::ZERO, 1_500.0),
+            point_size: 2.0,
         })
     }
 
@@ -66,8 +68,15 @@ impl Brume {
 
 impl eframe::App for Brume {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        egui::Panel::left("stats_panel").show(ui, |ui| self.report_ui(ui));
+        // Side panel: the report, then the controls.
+        egui::Panel::left("stats_panel").show(ui, |ui| {
+            self.report_ui(ui);
 
+            ui.separator();
+            ui.add(egui::Slider::new(&mut self.point_size, 1.0..=10.0).text("Point size (px)"));
+        });
+
+        // Central panel: the 3D view.
         egui::CentralPanel::default().show(ui, |ui| {
             let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::drag());
 
@@ -75,17 +84,29 @@ impl eframe::App for Brume {
                 let delta = response.drag_delta();
                 self.camera.orbit(delta.x, delta.y);
             }
-
             if response.hovered() {
                 let scroll = ui.input(|input| input.smooth_scroll_delta.y);
                 self.camera.zoom(scroll);
             }
 
-            let view_proj = self.camera.view_proj(rect.width() / rect.height());
-            ui.painter().add(egui_wgpu::Callback::new_paint_callback(
-                rect,
-                PointsCallback { view_proj },
-            ));
+            if rect.width() > 0.0 && rect.height() > 0.0 {
+                let view_proj = self.camera.view_proj(rect.width() / rect.height());
+
+                let pixels_per_point = ui.ctx().pixels_per_point();
+                let viewport = [
+                    rect.width() * pixels_per_point,
+                    rect.height() * pixels_per_point,
+                ];
+
+                ui.painter().add(egui_wgpu::Callback::new_paint_callback(
+                    rect,
+                    PointsCallback {
+                        view_proj,
+                        viewport,
+                        point_size: self.point_size,
+                    },
+                ));
+            }
         });
     }
 }

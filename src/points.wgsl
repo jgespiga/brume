@@ -12,6 +12,7 @@ var<uniform> camera: Camera;
 struct VertexIn {
     @location(0) position: vec3<f32>,
     @location(1) color: vec4<f32>,
+    @location(2) attributes: u32,
 };
 
 struct VertexOut {
@@ -29,19 +30,19 @@ var<private> CORNERS: array<vec2<f32>, 4> = array<vec2<f32>, 4>(
 
 @vertex
 fn vs_main(@builtin(vertex_index) corner_index: u32, in: VertexIn) -> VertexOut {
+    // Unpack the per-point attributes.
+    let classification = in.attributes & 0xFFu;
+    let intensity = in.attributes >> 16u;
+
+    // Position: same as before.
     var clip = camera.view_proj * vec4(in.position, 1.0);
-
-    // Move this corner by half the point size, in pixels.
-    // One pixel is 2 / viewport in clip units, so ±1 × (size / 2) × (2 / viewport).
     let offset = CORNERS[corner_index] * camera.point_size / camera.viewport;
-
-    // Multiply by w so the GPU's divide by w leaves the offset unchanged.
     clip = vec4(clip.xy + offset * clip.w, clip.z, clip.w);
 
     var out: VertexOut;
     out.clip = clip;
-    out.color = in.color;
-    
+    // Temporary test: ground (class 2) in red, everything else in its RGB.
+    out.color = select(in.color, vec4(1.0, 0.0, 0.0, 1.0), classification == 2u);
     return out;
 }
 

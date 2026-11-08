@@ -26,6 +26,7 @@ pub struct PointRenderer {
 struct ChunkBuffers {
     positions: wgpu::Buffer,
     colors: wgpu::Buffer,
+    attributes: wgpu::Buffer,
     len: u32,
 }
 
@@ -111,8 +112,39 @@ impl PointRenderer {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &vertex_layouts,
                 compilation_options: Default::default(),
+                buffers: &[
+                    // 0: positions
+                    Some(wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &[wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x3,
+                            offset: 0,
+                            shader_location: 0,
+                        }],
+                    }),
+                    // 1: colors
+                    Some(wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<[u8; 4]>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &[wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Unorm8x4,
+                            offset: 0,
+                            shader_location: 1,
+                        }],
+                    }),
+                    // 2: attributes (class | intensity << 16)  ← NEW
+                    Some(wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<u32>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &[wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Uint32,
+                            offset: 0,
+                            shader_location: 2,
+                        }],
+                    }),
+                ],
             },
 
             fragment: Some(wgpu::FragmentState {
@@ -139,21 +171,37 @@ impl PointRenderer {
         });
 
         // Upload every chunk once: two buffers each, straight from the SoA columns.
+        // Upload every chunk once: three buffers each, straight from the SoA columns.
         let chunks: Vec<ChunkBuffers> = cloud
             .chunks
             .iter()
-            .map(|chunk| ChunkBuffers {
-                positions: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("positions"),
-                    contents: bytemuck::cast_slice(&chunk.positions),
-                    usage: wgpu::BufferUsages::VERTEX,
-                }),
-                colors: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("colors"),
-                    contents: bytemuck::cast_slice(&chunk.colors),
-                    usage: wgpu::BufferUsages::VERTEX,
-                }),
-                len: chunk.len() as u32,
+            .map(|chunk| {
+                // Pack class (bits 0-7) and intensity (bits 16-31) into one u32 per point.
+                let attributes: Vec<u32> = chunk
+                    .classes
+                    .iter()
+                    .zip(&chunk.intensity)
+                    .map(|(&class, &intensity)| u32::from(class) | (u32::from(intensity) << 16))
+                    .collect();
+
+                ChunkBuffers {
+                    positions: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("positions"),
+                        contents: bytemuck::cast_slice(&chunk.positions),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    }),
+                    colors: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("colors"),
+                        contents: bytemuck::cast_slice(&chunk.colors),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    }),
+                    attributes: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("attributes"),
+                        contents: bytemuck::cast_slice(&attributes),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    }),
+                    len: chunk.len() as u32,
+                }
             })
             .collect();
 
@@ -215,6 +263,7 @@ impl egui_wgpu::CallbackTrait for PointsCallback {
         for chunk in &renderer.chunks {
             render_pass.set_vertex_buffer(0, chunk.positions.slice(..));
             render_pass.set_vertex_buffer(1, chunk.colors.slice(..));
+            render_pass.set_vertex_buffer(2, chunk.attributes.slice(..)); // ← NEW
             render_pass.draw(0..4, 0..chunk.len);
         }
     }

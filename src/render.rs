@@ -30,14 +30,24 @@ struct ChunkBuffers {
     len: u32,
 }
 
-/// Must match `struct Camera` in points.wgsl byte for byte (80 bytes).
+/// Must match `struct Camera` in points.wgsl byte for byte (96 bytes).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct CameraUniform {
     view_proj: [[f32; 4]; 4],
     viewport: [f32; 2],
     point_size: f32,
-    _padding: f32,
+    color_mode: u32,
+    height_range: [f32; 2],
+    intensity_range: [f32; 2],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorMode {
+    Rgb,
+    Height,
+    Classification,
+    Intensity,
 }
 
 impl PointRenderer {
@@ -224,6 +234,9 @@ pub struct PointsCallback {
     pub view_proj: Mat4,
     pub viewport: [f32; 2],
     pub point_size: f32,
+    pub color_mode: ColorMode,
+    pub height_range: [f32; 2],
+    pub intensity_range: [f32; 2],
 }
 
 impl egui_wgpu::CallbackTrait for PointsCallback {
@@ -239,7 +252,9 @@ impl egui_wgpu::CallbackTrait for PointsCallback {
             view_proj: self.view_proj.to_cols_array_2d(),
             viewport: self.viewport,
             point_size: self.point_size,
-            _padding: 0.0,
+            color_mode: self.color_mode as u32,
+            height_range: self.height_range,
+            intensity_range: self.intensity_range,
         };
 
         if let Some(renderer) = resources.get::<PointRenderer>() {

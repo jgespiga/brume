@@ -1,9 +1,10 @@
 struct Camera {
     view_proj: mat4x4<f32>,
-    // Drawing area in physical pixels.
-    viewport: vec2<f32>,   
-    // Square size in pixels.
-    point_size: f32,  
+    viewport: vec2<f32>,
+    point_size: f32,
+    color_mode: u32,
+    height_range: vec2<f32>,
+    intensity_range: vec2<f32>,
 };
 
 @group(0) @binding(0)
@@ -39,10 +40,27 @@ fn vs_main(@builtin(vertex_index) corner_index: u32, in: VertexIn) -> VertexOut 
     let offset = CORNERS[corner_index] * camera.point_size / camera.viewport;
     clip = vec4(clip.xy + offset * clip.w, clip.z, clip.w);
 
+    // Normalise height and intensity to 0..1 with the ranges from the uniform.
+    let height_t = clamp(
+        (in.position.z - camera.height_range.x) / (camera.height_range.y - camera.height_range.x),
+        0.0, 1.0,
+    );
+    let intensity_t = clamp(
+        (f32(intensity) - camera.intensity_range.x) / (camera.intensity_range.y - camera.intensity_range.x),
+        0.0, 1.0,
+    );
+
+    // Pick the colour by mode (0 RGB, 1 height, 2 class, 3 intensity).
+    var color = in.color;
+    switch camera.color_mode {
+        case 1u: { color = vec4(vec3(height_t), 1.0); }
+        case 3u: { color = vec4(vec3(intensity_t), 1.0); }
+        default: {}
+    }
+
     var out: VertexOut;
     out.clip = clip;
-    // Temporary test: ground (class 2) in red, everything else in its RGB.
-    out.color = select(in.color, vec4(1.0, 0.0, 0.0, 1.0), classification == 2u);
+    out.color = color;
     return out;
 }
 

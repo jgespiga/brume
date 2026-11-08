@@ -3,7 +3,7 @@ use eframe::{egui, egui_wgpu};
 use crate::{
     camera::OrbitCamera,
     cloud::{Cloud, Stats},
-    render::{PointRenderer, PointsCallback},
+    render::{ColorMode, PointRenderer, PointsCallback},
     report::{ClassRow, average_color, class_rows},
 };
 
@@ -14,6 +14,7 @@ pub struct Brume {
     average_color: Option<[u64; 3]>,
     camera: OrbitCamera,
     point_size: f32,
+    color_mode: ColorMode,
 }
 
 impl Brume {
@@ -31,6 +32,7 @@ impl Brume {
             average_color,
             camera: OrbitCamera::new(glam::Vec3::ZERO, 1_500.0),
             point_size: 2.0,
+            color_mode: ColorMode::Rgb,
         })
     }
 
@@ -73,7 +75,20 @@ impl eframe::App for Brume {
             self.report_ui(ui);
 
             ui.separator();
+
             ui.add(egui::Slider::new(&mut self.point_size, 1.0..=10.0).text("Point size (px)"));
+
+            ui.separator();
+
+            ui.label("Colour");
+            ui.radio_value(&mut self.color_mode, ColorMode::Rgb, "RGB");
+            ui.radio_value(&mut self.color_mode, ColorMode::Height, "Height");
+            ui.radio_value(
+                &mut self.color_mode,
+                ColorMode::Classification,
+                "Classification",
+            );
+            ui.radio_value(&mut self.color_mode, ColorMode::Intensity, "Intensity");
         });
 
         // Central panel: the 3D view.
@@ -104,6 +119,12 @@ impl eframe::App for Brume {
                         view_proj,
                         viewport,
                         point_size: self.point_size,
+                        color_mode: self.color_mode,
+                        height_range: [self.stats.local_min.z, self.stats.local_max.z],
+                        intensity_range: [
+                            self.stats.intensity_min as f32,
+                            self.stats.intensity_max as f32,
+                        ],
                     },
                 ));
             }

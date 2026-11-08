@@ -10,6 +10,9 @@ struct Camera {
 @group(0) @binding(0)
 var<uniform> camera: Camera;
 
+@group(0) @binding(1)
+var<uniform> class_palette: array<vec4<f32>, 256>;
+
 struct VertexIn {
     @location(0) position: vec3<f32>,
     @location(1) color: vec4<f32>,
@@ -54,6 +57,7 @@ fn vs_main(@builtin(vertex_index) corner_index: u32, in: VertexIn) -> VertexOut 
     var color = in.color;
     switch camera.color_mode {
         case 1u: { color = vec4(vec3(height_t), 1.0); }
+        case 2u: { color = class_palette[classification]; }
         case 3u: { color = vec4(vec3(intensity_t), 1.0); }
         default: {}
     }

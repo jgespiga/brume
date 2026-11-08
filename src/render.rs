@@ -8,6 +8,7 @@ use eframe::wgpu::{BindGroup, Buffer};
 use glam::Mat4;
 
 use crate::cloud::Cloud;
+use crate::report::class_color;
 
 /// Bits of depth buffer requested from `eframe`. The pipeline must use the same format.
 pub const DEPTH_BITS: u8 = 24;
@@ -77,17 +78,33 @@ impl PointRenderer {
         ];
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("camera"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: NonZeroU64::new(std::mem::size_of::<CameraUniform>() as u64),
+            label: Some("uniforms"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: NonZeroU64::new(
+                            std::mem::size_of::<CameraUniform>() as u64
+                        ),
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: NonZeroU64::new(
+                            (256 * std::mem::size_of::<[f32; 4]>()) as u64,
+                        ),
+                    },
+                    count: None,
+                },
+            ],
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -104,13 +121,38 @@ impl PointRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
+        // Class palette: 256 RGBA colours, one per possible class code.
+        let palette: Vec<[f32; 4]> = (0..=255u8)
+            .map(|code| {
+                let [r, g, b] = class_color(code);
+                [
+                    f32::from(r) / 255.0,
+                    f32::from(g) / 255.0,
+                    f32::from(b) / 255.0,
+                    1.0,
+                ]
+            })
+            .collect();
+
+        let palette_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("class palette"),
+            contents: bytemuck::cast_slice(&palette),
+            usage: wgpu::BufferUsages::UNIFORM, // never changes: no COPY_DST
+        });
+
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("camera"),
+            label: Some("uniforms"),
             layout: &bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: palette_buffer.as_entire_binding(),
+                },
+            ],
         });
 
         let depth_format = egui_wgpu::depth_format_from_bits(DEPTH_BITS, 0);

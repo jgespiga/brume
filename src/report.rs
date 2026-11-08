@@ -49,6 +49,30 @@ pub fn class_name(code: u8) -> &'static str {
     }
 }
 
+/// Maps each class code to the RGB colour it is drawn with.
+pub fn class_color(code: u8) -> [u8; 3] {
+    match code {
+        1 => [190, 190, 190],
+        2 => [170, 130, 80],
+        3 => [150, 210, 110],
+        4 => [80, 165, 70],
+        5 => [30, 105, 50],
+        6 => [220, 80, 60],
+        7 => [255, 0, 255],
+        9 => [50, 120, 220],
+        12 => [130, 130, 130],
+        14 => [250, 220, 50],
+        15 => [245, 150, 30],
+        17 => [150, 100, 170],
+        64 => [0, 220, 220],
+        65 => [240, 170, 160],
+        67 => [90, 80, 220],
+        68 => [235, 245, 255],
+        70 => [255, 120, 170],
+        _ => [90, 90, 90],
+    }
+}
+
 /// Returns each of the classes found in the file. Most common first.
 pub fn class_rows(stats: &Stats) -> Vec<ClassRow> {
     let total = stats.points.max(1) as f64;

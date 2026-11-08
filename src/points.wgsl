@@ -32,6 +32,19 @@ var<private> CORNERS: array<vec2<f32>, 4> = array<vec2<f32>, 4>(
     vec2( 1.0,  1.0),
 );
 
+// Polynomial fit of matplotlib's viridis colour map (by Matt Zucker, CC0).
+// t in 0..1: dark purple -> blue -> green -> yellow.
+fn viridis(t: f32) -> vec3<f32> {
+    let c0 = vec3(0.2777273272234177, 0.005407344544966578, 0.3340998053353061);
+    let c1 = vec3(0.1050930431085774, 1.404613529898575, 1.384590162594685);
+    let c2 = vec3(-0.3308618287255563, 0.214847559468213, 0.09509516302823659);
+    let c3 = vec3(-4.634230498983486, -5.799100973351585, -19.33244095627987);
+    let c4 = vec3(6.228269936347081, 14.17993336680509, 56.69055260068105);
+    let c5 = vec3(4.776384997670288, -13.74514537774601, -65.35303263337234);
+    let c6 = vec3(-5.435455855934631, 4.645852612178535, 26.3124352495832);
+    return c0 + t * (c1 + t * (c2 + t * (c3 + t * (c4 + t * (c5 + t * c6)))));
+}
+
 @vertex
 fn vs_main(@builtin(vertex_index) corner_index: u32, in: VertexIn) -> VertexOut {
     // Unpack the per-point attributes.
@@ -56,7 +69,7 @@ fn vs_main(@builtin(vertex_index) corner_index: u32, in: VertexIn) -> VertexOut 
     // Pick the colour by mode (0 RGB, 1 height, 2 class, 3 intensity).
     var color = in.color;
     switch camera.color_mode {
-        case 1u: { color = vec4(vec3(height_t), 1.0); }
+        case 1u: { color = vec4(viridis(height_t), 1.0); }
         case 2u: { color = class_palette[classification]; }
         case 3u: { color = vec4(vec3(intensity_t), 1.0); }
         default: {}

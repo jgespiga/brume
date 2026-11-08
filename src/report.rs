@@ -117,6 +117,46 @@ pub fn average_color(cloud: &Cloud) -> Option<[u64; 3]> {
     Some([avg[0], avg[1], avg[2]])
 }
 
+/// Returns the values at the `low` and `high` percentiles (0.0..=1.0).
+/// Reorders `values` in place.
+pub fn percentile_range(values: &mut [f32], low: f64, high: f64) -> [f32; 2] {
+    debug_assert!(low <= high && (0.0..=1.0).contains(&low) && (0.0..=1.0).contains(&high));
+
+    if values.is_empty() {
+        return [0.0, 1.0];
+    }
+
+    let last = (values.len() - 1) as f64;
+
+    [low, high].map(|percentile| {
+        let k = (last * percentile).round() as usize;
+        values.select_nth_unstable_by(k, |a, b| a.total_cmp(b));
+        values[k]
+    })
+}
+
+/// Returns the p1-p99 range of the points' heights.
+pub fn height_range(cloud: &Cloud) -> [f32; 2] {
+    let mut heights = cloud
+        .chunks
+        .iter()
+        .flat_map(|chunk| chunk.positions.iter().map(|position| position[2]))
+        .collect::<Vec<f32>>();
+
+    percentile_range(&mut heights, 0.01, 0.99)
+}
+
+/// Returns the p2-p98 range of the points' intensities.
+pub fn intensity_range(cloud: &Cloud) -> [f32; 2] {
+    let mut intensities = cloud
+        .chunks
+        .iter()
+        .flat_map(|chunk| chunk.intensity.iter().copied().map(f32::from))
+        .collect::<Vec<f32>>();
+
+    percentile_range(&mut intensities, 0.02, 0.98)
+}
+
 impl Report {
     /// Create a new [`Report`] containing all the information.
     pub fn new(cloud: &Cloud, stats: &Stats) -> Self {

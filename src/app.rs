@@ -4,7 +4,7 @@ use crate::{
     camera::OrbitCamera,
     cloud::{Cloud, Stats},
     render::{ColorMode, PointRenderer, PointsCallback},
-    report::{ClassRow, average_color, class_rows},
+    report::{ClassRow, average_color, class_rows, height_range, intensity_range},
 };
 
 pub struct Brume {
@@ -12,6 +12,8 @@ pub struct Brume {
     stats: Stats,
     class_rows: Vec<ClassRow>,
     average_color: Option<[u64; 3]>,
+    height_range: [f32; 2],
+    intensity_range: [f32; 2],
     camera: OrbitCamera,
     point_size: f32,
     color_mode: ColorMode,
@@ -24,12 +26,16 @@ impl Brume {
 
         let class_rows = class_rows(&stats);
         let average_color = average_color(&cloud);
+        let height_range = height_range(&cloud);
+        let intensity_range = intensity_range(&cloud);
 
         Some(Self {
             cloud,
             stats,
             class_rows,
             average_color,
+            height_range,
+            intensity_range,
             camera: OrbitCamera::new(glam::Vec3::ZERO, 1_500.0),
             point_size: 2.0,
             color_mode: ColorMode::Rgb,
@@ -49,6 +55,14 @@ impl Brume {
         ui.label(format!(
             "Intensity: {} – {}",
             self.stats.intensity_min, self.stats.intensity_max
+        ));
+        ui.label(format!(
+            "Height p1–p99: {:.1} – {:.1} m",
+            self.height_range[0], self.height_range[1]
+        ));
+        ui.label(format!(
+            "Intensity p2–p98: {:.0} – {:.0}",
+            self.intensity_range[0], self.intensity_range[1]
         ));
         if let Some([r, g, b]) = self.average_color {
             ui.label(format!("Average color: rgb({r}, {g}, {b})"));
@@ -120,11 +134,8 @@ impl eframe::App for Brume {
                         viewport,
                         point_size: self.point_size,
                         color_mode: self.color_mode,
-                        height_range: [self.stats.local_min.z, self.stats.local_max.z],
-                        intensity_range: [
-                            self.stats.intensity_min as f32,
-                            self.stats.intensity_max as f32,
-                        ],
+                        height_range: self.height_range,
+                        intensity_range: self.intensity_range,
                     },
                 ));
             }

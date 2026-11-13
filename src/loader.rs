@@ -1,5 +1,6 @@
 use std::{
     path::Path,
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
@@ -27,7 +28,19 @@ fn detect_color_depth(batch: &PointData) -> ColorDepth {
     }
 }
 
-pub(crate) fn load(path: &Path) -> Result<(Cloud, Stats)> {
+/// Returns the number of points declared in the file's header, without reading them.
+pub(crate) fn point_count(path: &Path) -> Result<u64> {
+    let reader = las::Reader::from_path(path)
+        .with_context(|| format!("could not open {}", path.display()))?;
+
+    Ok(reader.header().number_of_points())
+}
+
+/// Reads every point of the file into a [`Cloud`].
+///
+/// After each batch, `progress` holds the number of points read so far, so
+/// another thread can show how far the load has got.
+pub(crate) fn load(path: &Path, progress: &AtomicU64) -> Result<(Cloud, Stats)> {
     let start = Instant::now();
 
     // Create las reader.
@@ -122,6 +135,7 @@ pub(crate) fn load(path: &Path) -> Result<(Cloud, Stats)> {
         cloud.chunks.push(chunk);
 
         stats.points += batch.len() as u64;
+        progress.store(stats.points, Ordering::Relaxed);
 
         let read = reader.fill_points(BATCH_SIZE, &mut batch)?;
         if read == 0 {

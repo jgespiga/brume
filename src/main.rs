@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use eframe::egui_wgpu::wgpu;
 
 use crate::app::Brume;
@@ -14,32 +14,28 @@ mod render;
 mod report;
 mod scene;
 
-/// Command-line arguments: `brume [--no-vsync] <file.laz>`, flag in any position.
+/// Command-line arguments: `brume [--no-vsync] [file.laz]`, flag in any position.
 struct Args {
-    path: PathBuf,
+    /// File to open at startup. Without it, the window starts empty.
+    path: Option<PathBuf>,
     /// Present frames without waiting for vsync, so frame times measure Brume
     /// rather than the monitor's refresh rate. For benchmarking only.
     no_vsync: bool,
 }
 
-fn parse_args() -> Result<Args> {
+fn parse_args() -> Args {
     let (flags, positional): (Vec<String>, Vec<String>) = std::env::args()
         .skip(1)
         .partition(|arg| arg == "--no-vsync");
 
-    let path = positional
-        .into_iter()
-        .next()
-        .context("usage: brume [--no-vsync] <file.laz>")?;
-
-    Ok(Args {
-        path: path.into(),
+    Args {
+        path: positional.into_iter().next().map(PathBuf::from),
         no_vsync: !flags.is_empty(),
-    })
+    }
 }
 
 fn main() -> Result<()> {
-    let args = parse_args()?;
+    let args = parse_args();
 
     let mut options = eframe::NativeOptions {
         depth_buffer: render::DEPTH_BITS,

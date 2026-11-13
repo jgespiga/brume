@@ -1,10 +1,10 @@
-use std::{path::Path, sync::atomic::AtomicU64};
+use std::path::Path;
 
 use anyhow::Result;
 
 use crate::{
     cloud::{Cloud, Stats},
-    loader::load,
+    loader::{LoadControl, load},
     report::{ClassRow, average_color, class_rows, height_range, intensity_range},
 };
 
@@ -22,9 +22,9 @@ pub struct LoadedScene {
 
 /// Loads `path` and computes the report and colour ranges.
 ///
-/// `progress` holds the number of points read so far; see [`load`].
-pub fn load_scene(path: &Path, progress: &AtomicU64) -> Result<LoadedScene> {
-    let (cloud, stats) = load(path, progress)?;
+/// `control` reports progress and allows cancelling; see [`load`].
+pub fn load_scene(path: &Path, control: &LoadControl) -> Result<LoadedScene> {
+    let (cloud, stats) = load(path, control)?;
 
     Ok(LoadedScene {
         class_rows: class_rows(&stats),

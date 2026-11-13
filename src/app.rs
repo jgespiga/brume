@@ -2,20 +2,20 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::Ordering,
         mpsc::{self, Receiver, TryRecvError},
     },
     thread,
     time::{Duration, Instant},
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow};
 use eframe::{egui, egui_wgpu};
 
 use crate::{
-    camera::OrbitCamera,
+    camera::{FOV_Y, OrbitCamera},
     cloud::Cloud,
-    loader::point_count,
+    loader::{LoadControl, is_lidar_file, point_count},
     perf::FrameTimes,
     render::{ColorMode, PointRenderer, PointsCallback, instances_to_draw},
     scene::{LoadedScene, load_scene},
@@ -24,40 +24,43 @@ use crate::{
 /// Number of recent frames the performance figures are computed over.
 const FRAME_WINDOW: usize = 120;
 
-/// How often the loading screen redraws to update the progress bar and elapsed time.
+/// How often the window redraws during a load to update the progress bar and elapsed time.
 const LOADING_REFRESH: Duration = Duration::from_millis(50);
 
 pub struct Brume {
-    state: AppState,
+    /// The cloud on screen, if any. It stays there while another file loads.
+    scene: Option<Scene>,
+    /// The file being read in the background, if any.
+    pending: Option<PendingLoad>,
+    /// The last load error, shown until dismissed or until a load succeeds.
+    error: Option<String>,
+    /// A short informational message, such as "only the first dropped file was opened".
+    note: Option<String>,
     view: ViewSettings,
 }
 
-/// What the window is showing: Loading → Ready, or Loading → Failed.
-enum AppState {
-    /// A loader thread is reading the file.
-    Loading {
-        receiver: Receiver<Result<LoadedScene>>,
-        /// Points read so far, written by the loader thread.
-        progress: Arc<AtomicU64>,
-        /// Points declared in the file's header.
-        total: u64,
-        path: PathBuf,
-        started: Instant,
-    },
-    /// The file is loaded and uploaded to the GPU.
-    Ready(Box<ReadyState>),
-    /// Loading failed. The window stays open to show why.
-    Failed { path: PathBuf, error: String },
-}
-
-/// A loaded file and the camera looking at it.
-struct ReadyState {
-    scene: LoadedScene,
+/// A loaded file and the view state that belongs to it.
+struct Scene {
+    data: LoadedScene,
     camera: OrbitCamera,
+    path: PathBuf,
 }
 
-/// View settings and measurements that don't depend on the loaded file, so they
-/// survive a reload.
+/// A file being read by a "brume-loader" thread.
+///
+/// Dropping it cancels the load: replacing or clearing [`Brume::pending`] stops
+/// the old thread at its next batch, and its result is never received.
+struct PendingLoad {
+    receiver: Receiver<Result<LoadedScene>>,
+    control: Arc<LoadControl>,
+    /// Points declared in the file's header.
+    total: u64,
+    path: PathBuf,
+    started: Instant,
+}
+
+/// View settings and measurements the user chose, independent of the loaded file,
+/// so they survive a reload.
 struct ViewSettings {
     point_size: f32,
     color_mode: ColorMode,
@@ -75,108 +78,264 @@ struct ViewSettings {
 }
 
 impl Brume {
-    /// Opens the window and starts loading `path` in the background.
-    pub fn new(cc: &eframe::CreationContext<'_>, path: PathBuf) -> Option<Self> {
+    /// Opens the window, and starts loading `path` in the background if given.
+    pub fn new(cc: &eframe::CreationContext<'_>, path: Option<PathBuf>) -> Option<Self> {
         let render_state = cc.wgpu_render_state.as_ref()?;
         let gpu_info = gpu_info(&render_state.adapter.get_info());
 
-        Some(Self {
-            state: start_loading(&cc.egui_ctx, path),
+        let mut app = Self {
+            scene: None,
+            pending: None,
+            error: None,
+            note: None,
             view: ViewSettings::new(gpu_info),
-        })
+        };
+        if let Some(path) = path {
+            app.open(&cc.egui_ctx, path);
+        }
+
+        Some(app)
     }
 
-    /// Moves on from [`AppState::Loading`] once the loader thread has sent its result.
-    fn poll_loading(&mut self, frame: &eframe::Frame) {
-        let AppState::Loading { receiver, path, .. } = &self.state else {
+    /// Starts loading `path`, cancelling any load in progress. The current scene
+    /// stays on screen meanwhile.
+    ///
+    /// If the new file can't even be opened, the load in progress (if any) carries on.
+    fn open(&mut self, ctx: &egui::Context, path: PathBuf) {
+        if !is_lidar_file(&path) {
+            self.error = Some(format!("Not a LAS/LAZ file: {}", file_name(&path)));
+            return;
+        }
+
+        match PendingLoad::start(ctx, path) {
+            Ok(pending) => {
+                // Dropping the old `PendingLoad` cancels it.
+                self.pending = Some(pending);
+                self.error = None;
+                self.note = None;
+            }
+            Err(error) => self.error = Some(format!("{error:#}")),
+        }
+    }
+
+    /// Takes the result of the pending load once its thread has sent it.
+    fn poll_pending(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        let Some(pending) = &self.pending else {
             return;
         };
 
-        let next = match receiver.try_recv() {
-            Ok(Ok(scene)) => ready(scene, frame, path),
-            Ok(Err(error)) => AppState::Failed {
-                path: path.clone(),
-                error: format!("{error:#}"),
-            },
+        let result = match pending.receiver.try_recv() {
+            Ok(result) => result,
             Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => AppState::Failed {
-                path: path.clone(),
-                error: "the loader thread stopped without a result (it panicked)".to_owned(),
-            },
+            Err(TryRecvError::Disconnected) => Err(anyhow!(
+                "the loader thread stopped without a result (it panicked)"
+            )),
         };
 
-        self.state = next;
+        let path = pending.path.clone();
+        self.pending = None;
+
+        match result {
+            Ok(data) => self.show_scene(ctx, frame, data, path),
+            // The old scene, if any, stays on screen.
+            Err(error) => self.error = Some(format!("{}: {error:#}", file_name(&path))),
+        }
+    }
+
+    /// Uploads `data` to the GPU and puts it on screen with a fitted camera.
+    fn show_scene(
+        &mut self,
+        ctx: &egui::Context,
+        frame: &eframe::Frame,
+        data: LoadedScene,
+        path: PathBuf,
+    ) {
+        let Some(render_state) = frame.wgpu_render_state() else {
+            self.error = Some("Brume needs eframe's wgpu backend".to_owned());
+            return;
+        };
+
+        // Replaces the previous scene's buffers in egui's callback resources.
+        PointRenderer::register(render_state, &data.cloud);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
+            "Brume — {}",
+            file_name(&path)
+        )));
+
+        self.scene = Some(Scene::new(data, path));
+        self.error = None;
+    }
+
+    /// Opens the first dropped file that has a path. Opening several tiles at once
+    /// comes in a later step.
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input(|input| input.raw.dropped_files.clone());
+        if dropped.is_empty() {
+            return;
+        }
+
+        let Some(path) = dropped
+            .iter()
+            .map(|file| file.path())
+            .find(|path| !path.as_os_str().is_empty())
+            .map(Path::to_owned)
+        else {
+            self.error = Some("The dropped item is not a file on disk".to_owned());
+            return;
+        };
+
+        self.open(ctx, path);
+        // `open` leaves `error` empty only if the load started.
+        if dropped.len() > 1 && self.error.is_none() {
+            self.note = Some(format!(
+                "Opened the first of {} files: multiple tiles come later.",
+                dropped.len()
+            ));
+        }
     }
 }
 
-/// Starts reading `path` on a "brume-loader" thread and returns the state that
-/// waits for it.
-///
-/// The header is read here, on the UI thread, to know the total for the progress
-/// bar. It is small, and a missing or invalid file fails right away.
-fn start_loading(ctx: &egui::Context, path: PathBuf) -> AppState {
-    let started = Instant::now();
+impl PendingLoad {
+    /// Starts reading `path` on a "brume-loader" thread.
+    ///
+    /// The header is read here, on the UI thread, to know the total for the
+    /// progress bar. It is small, and a missing or invalid file fails right away.
+    fn start(ctx: &egui::Context, path: PathBuf) -> Result<Self> {
+        let started = Instant::now();
+        let total = point_count(&path)?;
 
-    let total = match point_count(&path) {
-        Ok(total) => total,
-        Err(error) => {
-            return AppState::Failed {
-                path,
-                error: format!("{error:#}"),
-            };
-        }
-    };
+        let (sender, receiver) = mpsc::channel();
+        let control = Arc::new(LoadControl::default());
 
-    let (sender, receiver) = mpsc::channel();
-    let progress = Arc::new(AtomicU64::new(0));
-
-    let spawned = thread::Builder::new()
-        .name("brume-loader".to_owned())
-        .spawn({
-            let ctx = ctx.clone();
-            let progress = Arc::clone(&progress);
-            let path = path.clone();
-            move || {
-                let result = load_scene(&path, &progress);
-                if let Ok(scene) = &result {
-                    scene.log();
+        thread::Builder::new()
+            .name("brume-loader".to_owned())
+            .spawn({
+                let ctx = ctx.clone();
+                let control = Arc::clone(&control);
+                let path = path.clone();
+                move || {
+                    let result = load_scene(&path, &control);
+                    if let Ok(scene) = &result {
+                        scene.log();
+                    }
+                    // Fails only if the load was cancelled or the window closed:
+                    // nobody is waiting for the result any more.
+                    let _ = sender.send(result);
+                    ctx.request_repaint();
                 }
-                // Fails only if the window was closed meanwhile: nobody is left to tell.
-                let _ = sender.send(result);
-                ctx.request_repaint();
-            }
-        });
+            })
+            .context("could not start the loader thread")?;
 
-    match spawned {
-        Ok(_) => AppState::Loading {
+        Ok(Self {
             receiver,
-            progress,
+            control,
             total,
             path,
             started,
-        },
-        Err(error) => AppState::Failed {
-            path,
-            error: format!("could not start the loader thread: {error}"),
-        },
+        })
+    }
+
+    /// Points read so far.
+    fn read(&self) -> u64 {
+        self.control.progress.load(Ordering::Relaxed)
     }
 }
 
-/// Uploads `scene` to the GPU and returns the Ready state, or Failed without wgpu.
-fn ready(scene: LoadedScene, frame: &eframe::Frame, path: &Path) -> AppState {
-    let Some(render_state) = frame.wgpu_render_state() else {
-        return AppState::Failed {
-            path: path.to_owned(),
-            error: "Brume needs eframe's wgpu backend".to_owned(),
-        };
-    };
+impl Drop for PendingLoad {
+    fn drop(&mut self) {
+        self.control.cancel.store(true, Ordering::Relaxed);
+    }
+}
 
-    PointRenderer::register(render_state, &scene.cloud);
+impl Scene {
+    fn new(data: LoadedScene, path: PathBuf) -> Self {
+        let camera = OrbitCamera::fit(data.stats.local_min, data.stats.local_max, FOV_Y);
 
-    AppState::Ready(Box::new(ReadyState {
-        scene,
-        camera: OrbitCamera::new(glam::Vec3::ZERO, 1_500.0),
-    }))
+        Self { data, camera, path }
+    }
+
+    fn report_ui(&self, ui: &mut egui::Ui) {
+        let data = &self.data;
+
+        ui.heading(file_name(&self.path));
+        ui.label(format!(
+            "Load time: {:.2} s",
+            data.stats.elapsed.as_secs_f64()
+        ));
+        ui.label(format!("Origin (UTM): {:.2?}", data.cloud.origin));
+        ui.label(format!("Local min (f32): {:.2?}", data.stats.local_min));
+        ui.label(format!("Local max (f32): {:.2?}", data.stats.local_max));
+        ui.label(format!("Color depth: {:?}", data.stats.color_depth));
+        ui.label(format!(
+            "Intensity: {} – {}",
+            data.stats.intensity_min, data.stats.intensity_max
+        ));
+        ui.label(format!(
+            "Height p1–p99: {:.1} – {:.1} m",
+            data.height_range[0], data.height_range[1]
+        ));
+        ui.label(format!(
+            "Intensity p2–p98: {:.0} – {:.0}",
+            data.intensity_range[0], data.intensity_range[1]
+        ));
+        if let Some([r, g, b]) = data.average_color {
+            ui.label(format!("Average color: rgb({r}, {g}, {b})"));
+        }
+
+        ui.separator();
+
+        egui::Grid::new("classes").striped(true).show(ui, |ui| {
+            for row in &data.class_rows {
+                ui.label(row.code.to_string());
+                ui.label(row.name);
+                ui.label(row.count.to_string());
+                ui.label(format!("{:.1}%", row.percent));
+                ui.end_row();
+            }
+        });
+    }
+
+    /// The 3D view in the central panel. Returns the panel's rect.
+    fn view_ui(&mut self, ui: &mut egui::Ui, view: &mut ViewSettings) -> egui::Rect {
+        let panel = egui::CentralPanel::default().show(ui, |ui| {
+            let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::drag());
+
+            if response.dragged() {
+                let delta = response.drag_delta();
+                self.camera.orbit(delta.x, delta.y);
+            }
+            if response.hovered() {
+                let scroll = ui.input(|input| input.smooth_scroll_delta.y);
+                self.camera.zoom(scroll);
+            }
+
+            if rect.width() > 0.0 && rect.height() > 0.0 {
+                let view_proj = self.camera.view_proj(rect.width() / rect.height());
+
+                let pixels_per_point = ui.ctx().pixels_per_point();
+                let viewport = [
+                    rect.width() * pixels_per_point,
+                    rect.height() * pixels_per_point,
+                ];
+                view.viewport_px = Some(viewport);
+
+                ui.painter().add(egui_wgpu::Callback::new_paint_callback(
+                    rect,
+                    PointsCallback {
+                        view_proj,
+                        viewport,
+                        point_size: view.point_size,
+                        color_mode: view.color_mode,
+                        height_range: self.data.height_range,
+                        intensity_range: self.data.intensity_range,
+                        draw_fraction: view.draw_fraction,
+                    },
+                ));
+            }
+        });
+
+        panel.response.rect
+    }
 }
 
 impl ViewSettings {
@@ -276,150 +435,150 @@ impl ViewSettings {
     }
 }
 
-impl ReadyState {
-    fn report_ui(&self, ui: &mut egui::Ui) {
-        let scene = &self.scene;
-
-        ui.heading("Brume");
-        ui.label(format!(
-            "Load time: {:.2} s",
-            scene.stats.elapsed.as_secs_f64()
-        ));
-        ui.label(format!("Origin (UTM): {:.2?}", scene.cloud.origin));
-        ui.label(format!("Local min (f32): {:.2?}", scene.stats.local_min));
-        ui.label(format!("Local max (f32): {:.2?}", scene.stats.local_max));
-        ui.label(format!("Color depth: {:?}", scene.stats.color_depth));
-        ui.label(format!(
-            "Intensity: {} – {}",
-            scene.stats.intensity_min, scene.stats.intensity_max
-        ));
-        ui.label(format!(
-            "Height p1–p99: {:.1} – {:.1} m",
-            scene.height_range[0], scene.height_range[1]
-        ));
-        ui.label(format!(
-            "Intensity p2–p98: {:.0} – {:.0}",
-            scene.intensity_range[0], scene.intensity_range[1]
-        ));
-        if let Some([r, g, b]) = scene.average_color {
-            ui.label(format!("Average color: rgb({r}, {g}, {b})"));
-        }
-
-        ui.separator();
-
-        egui::Grid::new("classes").striped(true).show(ui, |ui| {
-            for row in &scene.class_rows {
-                ui.label(row.code.to_string());
-                ui.label(row.name);
-                ui.label(row.count.to_string());
-                ui.label(format!("{:.1}%", row.percent));
-                ui.end_row();
-            }
-        });
+/// Compact load progress, messages and the "Open…" button, for the section pinned
+/// to the bottom of the side panel. Returns whether "Open…" was clicked.
+fn status_ui(
+    ui: &mut egui::Ui,
+    pending: &mut Option<PendingLoad>,
+    error: &mut Option<String>,
+    note: &mut Option<String>,
+) -> bool {
+    let cancelled = pending.as_ref().is_some_and(|load| {
+        ui.label(format!("Loading {}", file_name(&load.path)));
+        ui.horizontal(|ui| {
+            let cancel = ui.button("Cancel").clicked();
+            ui.add(egui::ProgressBar::new(fraction(load.read(), load.total)).show_percentage());
+            cancel
+        })
+        .inner
+    });
+    if cancelled {
+        // Dropping the `PendingLoad` cancels it.
+        *pending = None;
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, view: &mut ViewSettings) {
-        // Side panel: the report, the controls, then performance.
-        egui::Panel::left("stats_panel").show(ui, |ui| {
-            self.report_ui(ui);
+    messages_ui(ui, error, note);
 
-            ui.separator();
-
-            view.controls_ui(ui);
-
-            ui.separator();
-
-            ui.label("Performance");
-            view.perf_controls_ui(ui);
-            view.perf_ui(ui, &self.scene);
-        });
-
-        // Central panel: the 3D view.
-        egui::CentralPanel::default().show(ui, |ui| {
-            let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::drag());
-
-            if response.dragged() {
-                let delta = response.drag_delta();
-                self.camera.orbit(delta.x, delta.y);
-            }
-            if response.hovered() {
-                let scroll = ui.input(|input| input.smooth_scroll_delta.y);
-                self.camera.zoom(scroll);
-            }
-
-            if rect.width() > 0.0 && rect.height() > 0.0 {
-                let view_proj = self.camera.view_proj(rect.width() / rect.height());
-
-                let pixels_per_point = ui.ctx().pixels_per_point();
-                let viewport = [
-                    rect.width() * pixels_per_point,
-                    rect.height() * pixels_per_point,
-                ];
-                view.viewport_px = Some(viewport);
-
-                ui.painter().add(egui_wgpu::Callback::new_paint_callback(
-                    rect,
-                    PointsCallback {
-                        view_proj,
-                        viewport,
-                        point_size: view.point_size,
-                        color_mode: view.color_mode,
-                        height_range: self.scene.height_range,
-                        intensity_range: self.scene.intensity_range,
-                        draw_fraction: view.draw_fraction,
-                    },
-                ));
-            }
-        });
-    }
+    ui.button("Open…").clicked()
 }
 
-/// Centred progress screen shown while the loader thread runs.
-fn loading_ui(ui: &mut egui::Ui, path: &Path, read: u64, total: u64, started: Instant) {
-    let fraction = if total > 0 {
-        read as f32 / total as f32
-    } else {
-        0.0
-    };
+/// Centred screen shown while there is no scene: load progress or a hint, then
+/// messages and "Open…". Returns whether "Open…" was clicked, and the panel's rect.
+fn empty_ui(
+    ui: &mut egui::Ui,
+    pending: &mut Option<PendingLoad>,
+    error: &mut Option<String>,
+    note: &mut Option<String>,
+) -> (bool, egui::Rect) {
+    let panel = egui::CentralPanel::default().show(ui, |ui| {
+        ui.vertical_centered(|ui| {
+            ui.add_space(ui.available_height() * 0.35);
+
+            let cancelled = match pending.as_ref() {
+                Some(load) => loading_ui(ui, load),
+                None => {
+                    ui.heading("Drop a LAS/LAZ file here or use Open…");
+                    false
+                }
+            };
+            if cancelled {
+                *pending = None;
+            }
+
+            ui.add_space(8.0);
+            messages_ui(ui, error, note);
+
+            ui.button("Open…").clicked()
+        })
+        .inner
+    });
+
+    (panel.inner, panel.response.rect)
+}
+
+/// Full progress block for the empty screen. Returns whether "Cancel" was clicked.
+fn loading_ui(ui: &mut egui::Ui, load: &PendingLoad) -> bool {
+    let read = load.read();
+    let fraction = fraction(read, load.total);
     // The colour ranges are computed after the last batch, with the bar already full.
-    let stage = if read < total {
+    let stage = if read < load.total {
         "Reading points"
     } else {
         "Computing colour ranges"
     };
 
-    egui::CentralPanel::default().show(ui, |ui| {
-        ui.vertical_centered(|ui| {
-            ui.add_space(ui.available_height() * 0.4);
-            ui.heading(format!("Loading {}", file_name(path)));
-            ui.add(
-                egui::ProgressBar::new(fraction)
-                    .desired_width(400.0)
-                    .text(format!(
-                        "{read} / {total} points ({:.0}%)",
-                        fraction * 100.0
-                    )),
-            );
-            ui.label(format!(
-                "{stage} · {:.1} s",
-                started.elapsed().as_secs_f32()
-            ));
-        });
-    });
+    ui.heading(format!("Loading {}", file_name(&load.path)));
+    ui.add(
+        egui::ProgressBar::new(fraction)
+            .desired_width(400.0)
+            .text(format!(
+                "{read} / {} points ({:.0}%)",
+                load.total,
+                fraction * 100.0
+            )),
+    );
+    ui.label(format!(
+        "{stage} · {:.1} s",
+        load.started.elapsed().as_secs_f32()
+    ));
 
-    ui.ctx().request_repaint_after(LOADING_REFRESH);
+    ui.button("Cancel").clicked()
 }
 
-/// Centred error screen shown when loading failed.
-fn failed_ui(ui: &mut egui::Ui, path: &Path, error: &str) {
-    egui::CentralPanel::default().show(ui, |ui| {
-        ui.vertical_centered(|ui| {
-            ui.add_space(ui.available_height() * 0.4);
-            ui.heading("Could not load the file");
-            ui.label(path.display().to_string());
-            ui.colored_label(ui.visuals().error_fg_color, error);
-        });
-    });
+/// Shows the error in red and the note in weak text, each with a "Dismiss" button.
+fn messages_ui(ui: &mut egui::Ui, error: &mut Option<String>, note: &mut Option<String>) {
+    let error_color = ui.visuals().error_fg_color;
+    let note_color = ui.visuals().weak_text_color();
+
+    message_ui(ui, error, error_color);
+    message_ui(ui, note, note_color);
+}
+
+/// Shows `message` in `color` with a "Dismiss" button that clears it.
+fn message_ui(ui: &mut egui::Ui, message: &mut Option<String>, color: egui::Color32) {
+    let Some(text) = message else {
+        return;
+    };
+
+    ui.colored_label(color, text.as_str());
+    if ui.small_button("Dismiss").clicked() {
+        *message = None;
+    }
+}
+
+/// Darkens `rect` with a hint while files are dragged over the window.
+fn drop_overlay(ctx: &egui::Context, rect: egui::Rect) {
+    if ctx.input(|input| input.raw.hovered_files.is_empty()) {
+        return;
+    }
+
+    let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop_overlay"));
+    let painter = ctx.layer_painter(layer);
+    painter.rect_filled(rect, 0.0, egui::Color32::from_black_alpha(180));
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "Drop a LAS/LAZ file to open",
+        egui::FontId::proportional(24.0),
+        egui::Color32::WHITE,
+    );
+}
+
+/// Asks for a file with the system dialog. Blocks the UI until the dialog closes.
+fn pick_file() -> Option<PathBuf> {
+    // Both cases: some dialogs match the filter case-sensitively, and PNOA tiles end in `.LAZ`.
+    rfd::FileDialog::new()
+        .add_filter("LiDAR", &["las", "laz", "LAS", "LAZ"])
+        .pick_file()
+}
+
+/// Fraction of the points read, for a progress bar.
+fn fraction(read: u64, total: u64) -> f32 {
+    if total > 0 {
+        read as f32 / total as f32
+    } else {
+        0.0
+    }
 }
 
 /// Returns the last component of `path`, or the whole path if it has none.
@@ -455,19 +614,59 @@ fn format_or_dash(value: Option<f32>, decimals: usize, unit: &str) -> String {
 
 impl eframe::App for Brume {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        self.view.record_frame_time(ui);
-        self.poll_loading(frame);
+        let ctx = ui.ctx().clone();
 
-        match &mut self.state {
-            AppState::Loading {
-                progress,
-                total,
-                path,
-                started,
-                ..
-            } => loading_ui(ui, path, progress.load(Ordering::Relaxed), *total, *started),
-            AppState::Ready(ready) => ready.ui(ui, &mut self.view),
-            AppState::Failed { path, error } => failed_ui(ui, path, error),
+        self.view.record_frame_time(ui);
+        self.poll_pending(&ctx, frame);
+        self.handle_dropped_files(&ctx);
+        if self.pending.is_some() {
+            ctx.request_repaint_after(LOADING_REFRESH);
+        }
+
+        let (open_clicked, view_rect) = match &mut self.scene {
+            Some(scene) => {
+                // Side panel: the report, the controls and performance, scrolling
+                // above a status section pinned to the bottom (load progress,
+                // messages and "Open…"), so that section is always visible.
+                let open = egui::Panel::left("stats_panel")
+                    .show(ui, |ui| {
+                        // Laid out first so it claims its space at the bottom; the
+                        // scroll area then fills what is left.
+                        let open = egui::Panel::bottom("load_status")
+                            .resizable(false)
+                            .show(ui, |ui| {
+                                ui.add_space(4.0);
+                                status_ui(ui, &mut self.pending, &mut self.error, &mut self.note)
+                            })
+                            .inner;
+
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            scene.report_ui(ui);
+
+                            ui.separator();
+
+                            self.view.controls_ui(ui);
+
+                            ui.separator();
+
+                            ui.label("Performance");
+                            self.view.perf_controls_ui(ui);
+                            self.view.perf_ui(ui, &scene.data);
+                        });
+
+                        open
+                    })
+                    .inner;
+
+                (open, scene.view_ui(ui, &mut self.view))
+            }
+            None => empty_ui(ui, &mut self.pending, &mut self.error, &mut self.note),
+        };
+
+        drop_overlay(&ctx, view_rect);
+
+        if open_clicked && let Some(path) = pick_file() {
+            self.open(&ctx, path);
         }
     }
 }

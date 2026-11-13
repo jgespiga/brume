@@ -1,10 +1,10 @@
 use std::{
     path::Path,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use glam::{DVec3, Vec3};
 use las::PointData;
 
@@ -13,6 +13,24 @@ use crate::cloud::{Cloud, ColorDepth, NO_COLOR, PointChunk, Stats};
 /// Avoid reading the whole file at once. Instead, we
 /// will read batches of aprox 1 million points.
 const BATCH_SIZE: u64 = 1 << 20;
+
+/// Shared between a loader thread and the UI: progress goes out, cancellation comes in.
+#[derive(Default)]
+pub(crate) struct LoadControl {
+    /// Points read so far, updated after each batch.
+    pub progress: AtomicU64,
+    /// Set by the UI to ask the loader to stop at the next batch boundary.
+    pub cancel: AtomicBool,
+}
+
+/// Returns whether `path` has a `.las` or `.laz` extension, ignoring case.
+pub(crate) fn is_lidar_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("las") || extension.eq_ignore_ascii_case("laz")
+        })
+}
 
 fn detect_color_depth(batch: &PointData) -> ColorDepth {
     match batch.rgb() {
@@ -38,9 +56,10 @@ pub(crate) fn point_count(path: &Path) -> Result<u64> {
 
 /// Reads every point of the file into a [`Cloud`].
 ///
-/// After each batch, `progress` holds the number of points read so far, so
-/// another thread can show how far the load has got.
-pub(crate) fn load(path: &Path, progress: &AtomicU64) -> Result<(Cloud, Stats)> {
+/// After each batch, `control.progress` holds the number of points read so far,
+/// so another thread can show how far the load has got. If `control.cancel` is
+/// set, the load stops there and returns a "load cancelled" error.
+pub(crate) fn load(path: &Path, control: &LoadControl) -> Result<(Cloud, Stats)> {
     let start = Instant::now();
 
     // Create las reader.
@@ -135,7 +154,10 @@ pub(crate) fn load(path: &Path, progress: &AtomicU64) -> Result<(Cloud, Stats)> 
         cloud.chunks.push(chunk);
 
         stats.points += batch.len() as u64;
-        progress.store(stats.points, Ordering::Relaxed);
+        control.progress.store(stats.points, Ordering::Relaxed);
+        if control.cancel.load(Ordering::Relaxed) {
+            bail!("load cancelled");
+        }
 
         let read = reader.fill_points(BATCH_SIZE, &mut batch)?;
         if read == 0 {
@@ -146,4 +168,23 @@ pub(crate) fn load(path: &Path, progress: &AtomicU64) -> Result<(Cloud, Stats)> 
     stats.elapsed = start.elapsed();
 
     Ok((cloud, stats))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_las_and_laz_in_any_case() {
+        for name in ["tile.las", "tile.laz", "tile.LAZ", "dir/tile.LaS"] {
+            assert!(is_lidar_file(Path::new(name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn rejects_other_extensions() {
+        for name in ["tile.txt", "tile.copc", "tile.las.zip", "tile", "laz"] {
+            assert!(!is_lidar_file(Path::new(name)), "{name}");
+        }
+    }
 }

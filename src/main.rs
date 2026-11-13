@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use eframe::egui_wgpu::wgpu;
 
 use crate::{
     app::Brume,
@@ -11,8 +12,33 @@ mod app;
 mod camera;
 mod cloud;
 mod loader;
+mod perf;
 mod render;
 mod report;
+
+/// Command-line arguments: `brume [--no-vsync] <file.laz>`, flag in any position.
+struct Args {
+    path: String,
+    /// Present frames without waiting for vsync, so frame times measure Brume
+    /// rather than the monitor's refresh rate. For benchmarking only.
+    no_vsync: bool,
+}
+
+fn parse_args() -> Result<Args> {
+    let (flags, positional): (Vec<String>, Vec<String>) = std::env::args()
+        .skip(1)
+        .partition(|arg| arg == "--no-vsync");
+
+    let path = positional
+        .into_iter()
+        .next()
+        .context("usage: brume [--no-vsync] <file.laz>")?;
+
+    Ok(Args {
+        path,
+        no_vsync: !flags.is_empty(),
+    })
+}
 
 fn log_stats(cloud: &Cloud, stats: &Stats) {
     println!("Time: {:.2}", stats.elapsed.as_secs_f64());
@@ -42,17 +68,22 @@ fn log_stats(cloud: &Cloud, stats: &Stats) {
 }
 
 fn main() -> Result<()> {
-    let path_str = std::env::args().nth(1).context("usage: brume <file.laz>")?;
-    let path = std::path::Path::new(&path_str);
+    let args = parse_args()?;
+    let path = std::path::Path::new(&args.path);
 
     let (cloud, stats) = load(path)?;
 
     log_stats(&cloud, &stats);
 
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         depth_buffer: render::DEPTH_BITS,
         ..Default::default()
     };
+    if args.no_vsync {
+        // `glow_options.vsync` only applies to the glow backend: wgpu reads the
+        // surface's present mode instead.
+        options.wgpu_options.surface.present_mode = wgpu::PresentMode::AutoNoVsync;
+    }
     eframe::run_native(
         "Brume",
         options,

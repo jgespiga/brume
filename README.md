@@ -1,0 +1,73 @@
+# Brume
+
+A LiDAR point cloud viewer written in Rust, built to render tens of millions
+of points interactively.
+
+> **Status:** phase 0 of 4. Brume loads LAS/LAZ files into a GPU-ready
+> layout and reports what they contain. The 3D viewer (egui + wgpu) is next.
+
+## Data
+
+Brume is developed with Spain's national LiDAR survey, PNOA-LiDAR (third
+coverage, 2022–2025): 1 × 1 km tiles in LAZ, with RGB, near infrared and
+classification.
+
+1. Register at the [CNIG download centre](https://centrodedescargas.cnig.es/CentroDescargas/lidar-tercera-cobertura).
+2. Search by municipality and download a tile (prefer NPC02 or NPC03).
+3. Save it in `data/` (ignored by git).
+
+Data: © Instituto Geográfico Nacional, PNOA-LiDAR, CC BY 4.0.
+
+## Usage
+
+```sh
+# Load and print a report
+cargo run --release -- data/tile.laz
+```
+
+## Design
+
+- **Local coordinates.** UTM northings near Madrid are ~4.46 million metres,
+  where consecutive `f32` values are 0.5 m apart. Brume subtracts a per-file
+  origin in `f64` and stores `f32` offsets, which keeps ~0.03 mm precision
+  within a 1 km tile.
+- **Column storage (SoA).** Positions, colours, classes and intensity live in
+  separate vectors, so each can be uploaded to its own GPU buffer as is.
+- **Batched reading.** Points are decoded in batches of ~1 M into a reused
+  buffer, keeping memory bounded and producing chunks for streaming.
+- **Colour depth detection.** The LAS spec asks for 16-bit colour, but many
+  files store 0–255. Brume checks the data before converting to 8 bits.
+- **Classification mask.** Legacy point formats pack flags into the class
+  byte; Brume masks them out, and keeps the full byte for LAS 1.4 formats.
+
+## Performance
+
+Tile `PNOA-2024-MAD-419-4463`: 7,533,341 points (7.5 pts/m²).
+
+| Mode | Load time | Speedup |
+| --- | --- | --- |
+| Sequential LAZ decompression | 5.5 s | 1.0× |
+| Parallel LAZ decompression | 2.0 s | 2.75× |
+
+On 4 cores the speedup is bounded by the serial part of loading
+(~15 % by Amdahl's law): mostly single-threaded conversion. Phase 2 overlaps
+decoding and conversion on separate threads.
+
+Hardware: <CPU model>, <RAM>, <OS>.
+
+### Rendering
+
+| Points | Load time (s) | Avg frame (ms) | Worst frame (ms) | Resolution | GPU | Vsync |
+| --- | --- | --- | --- | --- | --- | --- |
+| 7,533,341 | 2.15 | 67 | 195 | 2258×1355 | GTX 750 Ti (Vulkan, NVIDIA 550.163.01) | off |
+
+Frame times are measured with `--no-vsync` and *Continuous repaint* on, and
+are CPU-side frame intervals (the time between consecutive `ui` calls), not
+GPU execution time.
+
+## Roadmap
+
+- [x] Phase 0: load LAS/LAZ, local coordinates, column storage, statistics
+- [ ] Phase 1: egui window, wgpu point rendering, orbit camera, colour modes
+- [ ] Phase 2: background loading, multiple tiles
+- [ ] Phase 3: octree with level of detail and a point budget

@@ -279,6 +279,16 @@ pub struct PointsCallback {
     pub color_mode: ColorMode,
     pub height_range: [f32; 2],
     pub intensity_range: [f32; 2],
+    /// Fraction of each chunk to draw (0.01..=1.0). See [`instances_to_draw`].
+    pub draw_fraction: f32,
+}
+
+/// Number of points drawn from a chunk of `len` points when drawing `fraction` of it.
+///
+/// Benchmarking aid: it draws the first part of each chunk, which is file order,
+/// not a spatially uniform subset, so the visible points are not representative.
+pub fn instances_to_draw(len: u32, fraction: f32) -> u32 {
+    ((len as f32 * fraction).ceil() as u32).min(len)
 }
 
 impl egui_wgpu::CallbackTrait for PointsCallback {
@@ -321,7 +331,8 @@ impl egui_wgpu::CallbackTrait for PointsCallback {
             render_pass.set_vertex_buffer(0, chunk.positions.slice(..));
             render_pass.set_vertex_buffer(1, chunk.colors.slice(..));
             render_pass.set_vertex_buffer(2, chunk.attributes.slice(..)); // ← NEW
-            render_pass.draw(0..4, 0..chunk.len);
+            let instances = instances_to_draw(chunk.len, self.draw_fraction);
+            render_pass.draw(0..4, 0..instances);
         }
     }
 }

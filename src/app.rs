@@ -15,6 +15,7 @@ use eframe::{egui, egui_wgpu};
 use crate::{
     camera::{FOV_Y, OrbitCamera},
     loader::{LoadControl, is_lidar_file},
+    octree::OctreeStats,
     perf::FrameTimes,
     render::{ColorMode, PointRenderer, PointsCallback, instances_to_draw},
     scene::{LoadPlan, LoadedScene, load_scene},
@@ -379,6 +380,18 @@ impl PendingLoad {
             format!("tile {} of {count}: {name}", index + 1)
         }
     }
+
+    /// What the loader thread is doing now.
+    fn stage(&self) -> &'static str {
+        if self.control.building_octree.load(Ordering::Relaxed) {
+            "Building octree"
+        } else if self.read() < self.total {
+            "Reading points"
+        } else {
+            // The colour ranges are computed after the last tile, with the bar full.
+            "Computing colour ranges"
+        }
+    }
 }
 
 impl Drop for PendingLoad {
@@ -401,18 +414,47 @@ impl Scene {
         }
     }
 
-    /// One row per tile (name, points, load time), with a checkbox that shows or
-    /// hides it.
+    /// One row per tile (name, points, load time, octree build time, nodes and
+    /// depth), with a checkbox that shows or hides it, then each tile's points per
+    /// octree level.
     fn tiles_ui(&mut self, ui: &mut egui::Ui) {
+        let octrees: Vec<OctreeStats> = self
+            .data
+            .tiles
+            .iter()
+            .map(|tile| tile.octree.stats())
+            .collect();
+
         ui.label("Tiles");
         egui::Grid::new("tiles").striped(true).show(ui, |ui| {
-            for (tile, visible) in self.data.tiles.iter().zip(&mut self.visible) {
+            for heading in ["", "Points", "Load", "Octree", "Nodes", "Depth"] {
+                ui.weak(heading);
+            }
+            ui.end_row();
+
+            let rows = self.data.tiles.iter().zip(&mut self.visible).zip(&octrees);
+            for ((tile, visible), octree) in rows {
                 ui.checkbox(visible, file_name(&tile.path));
                 ui.label(tile.stats.points.to_string());
                 ui.label(format!("{:.2} s", tile.stats.elapsed.as_secs_f64()));
+                ui.label(format!("{:.0} ms", tile.octree_time.as_secs_f64() * 1000.0));
+                ui.label(octree.nodes.to_string());
+                ui.label(octree.max_depth.to_string());
                 ui.end_row();
             }
         });
+
+        let single = self.data.tiles.len() == 1;
+        for (index, (tile, octree)) in self.data.tiles.iter().zip(&octrees).enumerate() {
+            let title = if single {
+                "Points per level".to_owned()
+            } else {
+                format!("Points per level: {}", file_name(&tile.path))
+            };
+            egui::CollapsingHeader::new(title)
+                .id_salt(("points_per_level", index))
+                .show(ui, |ui| levels_ui(ui, index, octree));
+        }
     }
 
     fn report_ui(&self, ui: &mut egui::Ui) {
@@ -612,7 +654,7 @@ fn status_ui(
     note: &mut Option<String>,
 ) -> Option<FileAction> {
     let cancelled = pending.as_ref().is_some_and(|load| {
-        ui.label(format!("Loading {}", load.label()));
+        ui.label(format!("Loading {} · {}", load.label(), load.stage()));
         ui.horizontal(|ui| {
             let cancel = ui.button("Cancel").clicked();
             ui.add(egui::ProgressBar::new(fraction(load.read(), load.total)).show_percentage());
@@ -678,16 +720,23 @@ fn empty_ui(
     (panel.inner, panel.response.rect)
 }
 
+/// One row per octree level of a tile: depth and points kept at that depth.
+fn levels_ui(ui: &mut egui::Ui, index: usize, octree: &OctreeStats) {
+    egui::Grid::new(("levels", index))
+        .striped(true)
+        .show(ui, |ui| {
+            for (depth, points) in octree.points_per_level.iter().enumerate() {
+                ui.label(depth.to_string());
+                ui.label(points.to_string());
+                ui.end_row();
+            }
+        });
+}
+
 /// Full progress block for the empty screen. Returns whether "Cancel" was clicked.
 fn loading_ui(ui: &mut egui::Ui, load: &PendingLoad) -> bool {
     let read = load.read();
     let fraction = fraction(read, load.total);
-    // The colour ranges are computed after the last batch, with the bar already full.
-    let stage = if read < load.total {
-        "Reading points"
-    } else {
-        "Computing colour ranges"
-    };
 
     ui.heading(format!("Loading {}", load.label()));
     ui.add(
@@ -700,7 +749,8 @@ fn loading_ui(ui: &mut egui::Ui, load: &PendingLoad) -> bool {
             )),
     );
     ui.label(format!(
-        "{stage} · {:.1} s",
+        "{} · {:.1} s",
+        load.stage(),
         load.started.elapsed().as_secs_f32()
     ));
 

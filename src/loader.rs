@@ -8,7 +8,10 @@ use anyhow::{Context, Result, bail};
 use glam::DVec3;
 use las::PointData;
 
-use crate::cloud::{Bounds, ColorDepth, NO_COLOR, PointChunk, Stats, Tile};
+use crate::{
+    cloud::{Bounds, ColorDepth, NO_COLOR, PointChunk, Stats, Tile},
+    octree::{Octree, OctreeParams},
+};
 
 /// Avoid reading the whole file at once. Instead, we
 /// will read batches of aprox 1 million points.
@@ -21,7 +24,10 @@ pub(crate) struct LoadControl {
     pub progress: AtomicU64,
     /// Index of the tile being read, for "tile i of N".
     pub tile: AtomicUsize,
-    /// Set by the UI to ask the loader to stop at the next batch boundary.
+    /// Whether the octree of the current tile is being built.
+    pub building_octree: AtomicBool,
+    /// Set by the UI to ask the loader to stop at the next batch boundary, or the
+    /// next octree node.
     pub cancel: AtomicBool,
 }
 
@@ -72,7 +78,7 @@ pub(crate) fn read_header_info(path: &Path) -> Result<HeaderInfo> {
 }
 
 /// Reads every point of the file into a [`Tile`], with positions relative to
-/// `origin` (global - origin, as f32).
+/// `origin` (global - origin, as f32), and builds its octree.
 ///
 /// After each batch, the batch's points are added to `control.progress`, so
 /// another thread can show how far a load of one or several tiles has got. If
@@ -167,11 +173,40 @@ pub(crate) fn load(path: &Path, origin: DVec3, control: &LoadControl) -> Result<
 
     stats.elapsed = start.elapsed();
 
+    let octree_start = Instant::now();
+    let (chunks, octree) = build_octree(chunks, control)?;
+    let octree_time = octree_start.elapsed();
+
     Ok(Tile {
         path: path.to_owned(),
         chunks,
         stats,
+        octree,
+        octree_time,
     })
+}
+
+/// Builds the octree of the points in `chunks` and returns them reordered by node
+/// (breadth first), in chunks of [`BATCH_SIZE`] like the ones read, with the tree.
+fn build_octree(
+    chunks: Vec<PointChunk>,
+    control: &LoadControl,
+) -> Result<(Vec<PointChunk>, Octree)> {
+    control.building_octree.store(true, Ordering::Relaxed);
+
+    // The build needs all positions in one slice.
+    let points = PointChunk::concat(chunks);
+    let built = Octree::build(&points.positions, &OctreeParams::default(), || {
+        control.cancel.load(Ordering::Relaxed)
+    });
+    let Some((octree, order)) = built else {
+        bail!("load cancelled");
+    };
+    let chunks = points.reordered(&order, BATCH_SIZE as usize);
+
+    control.building_octree.store(false, Ordering::Relaxed);
+
+    Ok((chunks, octree))
 }
 
 #[cfg(test)]

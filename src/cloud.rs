@@ -2,6 +2,8 @@ use std::{path::PathBuf, time::Duration};
 
 use glam::{DVec3, Vec3};
 
+use crate::octree::{Octree, permute};
+
 pub(crate) const NO_COLOR: [u8; 4] = [190, 190, 190, 255];
 
 /// SoA representation of a batch of points.
@@ -26,6 +28,41 @@ pub(crate) struct PointChunk {
 impl PointChunk {
     pub fn len(&self) -> usize {
         self.positions.len()
+    }
+
+    /// Joins `chunks` into one chunk with contiguous columns, freeing each chunk
+    /// once it is copied.
+    pub fn concat(chunks: Vec<PointChunk>) -> PointChunk {
+        let len = chunks.iter().map(PointChunk::len).sum();
+        let mut all = PointChunk {
+            positions: Vec::with_capacity(len),
+            classes: Vec::with_capacity(len),
+            colors: Vec::with_capacity(len),
+            intensity: Vec::with_capacity(len),
+        };
+
+        for chunk in chunks {
+            all.positions.extend(chunk.positions);
+            all.classes.extend(chunk.classes);
+            all.colors.extend(chunk.colors);
+            all.intensity.extend(chunk.intensity);
+        }
+
+        all
+    }
+
+    /// The points in the order given by `order` (indices into this chunk), split
+    /// into chunks of `chunk_size` points; only the last one may be shorter.
+    pub fn reordered(&self, order: &[u32], chunk_size: usize) -> Vec<PointChunk> {
+        order
+            .chunks(chunk_size.max(1))
+            .map(|part| PointChunk {
+                positions: permute(&self.positions, part),
+                classes: permute(&self.classes, part),
+                colors: permute(&self.colors, part),
+                intensity: permute(&self.intensity, part),
+            })
+            .collect()
     }
 }
 
@@ -119,8 +156,15 @@ impl Bounds {
 /// Immutable once loaded, and shared between scenes with an `Arc`.
 pub(crate) struct Tile {
     pub path: PathBuf,
+    /// The points in octree order: node by node, breadth first, so coarse levels
+    /// come first. Every chunk has the loader's batch size except the last, so
+    /// point `i` is in chunk `i / batch size`.
     pub chunks: Vec<PointChunk>,
     pub stats: Stats,
+    /// Level-of-detail octree; its nodes index into the points above.
+    pub octree: Octree,
+    /// Time to build the octree and reorder the points.
+    pub octree_time: Duration,
 }
 
 #[cfg(test)]

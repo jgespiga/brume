@@ -1,14 +1,14 @@
 use std::{
     path::Path,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
-    time::{Duration, Instant},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    time::Instant,
 };
 
 use anyhow::{Context, Result, bail};
-use glam::{DVec3, Vec3};
+use glam::DVec3;
 use las::PointData;
 
-use crate::cloud::{Cloud, ColorDepth, NO_COLOR, PointChunk, Stats};
+use crate::cloud::{Bounds, ColorDepth, NO_COLOR, PointChunk, Stats, Tile};
 
 /// Avoid reading the whole file at once. Instead, we
 /// will read batches of aprox 1 million points.
@@ -17,8 +17,10 @@ const BATCH_SIZE: u64 = 1 << 20;
 /// Shared between a loader thread and the UI: progress goes out, cancellation comes in.
 #[derive(Default)]
 pub(crate) struct LoadControl {
-    /// Points read so far, updated after each batch.
+    /// Points read so far, across every tile of the load, updated after each batch.
     pub progress: AtomicU64,
+    /// Index of the tile being read, for "tile i of N".
+    pub tile: AtomicUsize,
     /// Set by the UI to ask the loader to stop at the next batch boundary.
     pub cancel: AtomicBool,
 }
@@ -46,32 +48,41 @@ fn detect_color_depth(batch: &PointData) -> ColorDepth {
     }
 }
 
-/// Returns the number of points declared in the file's header, without reading them.
-pub(crate) fn point_count(path: &Path) -> Result<u64> {
-    let reader = las::Reader::from_path(path)
-        .with_context(|| format!("could not open {}", path.display()))?;
-
-    Ok(reader.header().number_of_points())
+/// What a file's header says, read without reading any point.
+pub(crate) struct HeaderInfo {
+    pub points: u64,
+    /// Bounds of the points, in the file's (global) coordinates.
+    pub bounds: Bounds,
 }
 
-/// Reads every point of the file into a [`Cloud`].
+/// Reads the point count and bounds from the file's header, without reading points.
+pub(crate) fn read_header_info(path: &Path) -> Result<HeaderInfo> {
+    let reader = las::Reader::from_path(path)
+        .with_context(|| format!("could not open {}", path.display()))?;
+    let header = reader.header();
+    let bounds = header.bounds();
+
+    Ok(HeaderInfo {
+        points: header.number_of_points(),
+        bounds: Bounds {
+            min: DVec3::new(bounds.min.x, bounds.min.y, bounds.min.z),
+            max: DVec3::new(bounds.max.x, bounds.max.y, bounds.max.z),
+        },
+    })
+}
+
+/// Reads every point of the file into a [`Tile`], with positions relative to
+/// `origin` (global - origin, as f32).
 ///
-/// After each batch, `control.progress` holds the number of points read so far,
-/// so another thread can show how far the load has got. If `control.cancel` is
-/// set, the load stops there and returns a "load cancelled" error.
-pub(crate) fn load(path: &Path, control: &LoadControl) -> Result<(Cloud, Stats)> {
+/// After each batch, the batch's points are added to `control.progress`, so
+/// another thread can show how far a load of one or several tiles has got. If
+/// `control.cancel` is set, the load stops there and returns a "load cancelled" error.
+pub(crate) fn load(path: &Path, origin: DVec3, control: &LoadControl) -> Result<Tile> {
     let start = Instant::now();
 
     // Create las reader.
     let mut reader = las::Reader::from_path(path)?;
     let n_points = reader.header().number_of_points();
-
-    // Calculate the origin based on the header bounds.
-    let bounds = reader.header().bounds();
-    let min = DVec3::new(bounds.min.x, bounds.min.y, bounds.min.z);
-    let max = DVec3::new(bounds.max.x, bounds.max.y, bounds.max.z);
-
-    let origin = ((min + max) * 0.5).round();
 
     // Calculate the number of batches we are going to process.
     let n_batches = n_points.div_ceil(BATCH_SIZE) as usize;
@@ -79,21 +90,8 @@ pub(crate) fn load(path: &Path, control: &LoadControl) -> Result<(Cloud, Stats)>
     let extended = reader.header().point_format().is_extended;
     let class_mask: u8 = if extended { 0xFF } else { 0x1F };
 
-    let mut cloud = Cloud {
-        origin,
-        chunks: Vec::with_capacity(n_batches),
-    };
-
-    let mut stats = Stats {
-        points: 0,
-        class_counts: [0; 256],
-        color_depth: ColorDepth::None,
-        local_min: Vec3::splat(f32::INFINITY),
-        local_max: Vec3::splat(f32::NEG_INFINITY),
-        intensity_min: u16::MAX,
-        intensity_max: u16::MIN,
-        elapsed: Duration::ZERO,
-    };
+    let mut chunks = Vec::with_capacity(n_batches);
+    let mut stats = Stats::empty();
 
     let mut batch = reader.read_points(BATCH_SIZE)?;
     stats.color_depth = detect_color_depth(&batch);
@@ -151,10 +149,12 @@ pub(crate) fn load(path: &Path, control: &LoadControl) -> Result<(Cloud, Stats)>
         debug_assert_eq!(chunk.colors.len(), chunk.len());
         debug_assert_eq!(chunk.intensity.len(), chunk.len());
 
-        cloud.chunks.push(chunk);
+        chunks.push(chunk);
 
         stats.points += batch.len() as u64;
-        control.progress.store(stats.points, Ordering::Relaxed);
+        control
+            .progress
+            .fetch_add(batch.len() as u64, Ordering::Relaxed);
         if control.cancel.load(Ordering::Relaxed) {
             bail!("load cancelled");
         }
@@ -167,7 +167,11 @@ pub(crate) fn load(path: &Path, control: &LoadControl) -> Result<(Cloud, Stats)>
 
     stats.elapsed = start.elapsed();
 
-    Ok((cloud, stats))
+    Ok(Tile {
+        path: path.to_owned(),
+        chunks,
+        stats,
+    })
 }
 
 #[cfg(test)]

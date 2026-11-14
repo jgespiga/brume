@@ -1,4 +1,4 @@
-use std::num::NonZeroU64;
+use std::{num::NonZeroU64, sync::Arc};
 
 use bytemuck::{Pod, Zeroable};
 use eframe::egui;
@@ -7,7 +7,7 @@ use eframe::wgpu::util::DeviceExt;
 use eframe::wgpu::{BindGroup, Buffer};
 use glam::Mat4;
 
-use crate::cloud::Cloud;
+use crate::cloud::Tile;
 use crate::report::class_color;
 
 /// Bits of depth buffer requested from `eframe`. The pipeline must use the same format.
@@ -18,9 +18,15 @@ pub const DEPTH_BITS: u8 = 24;
 /// Stored in egui's renderer, not in the app.
 pub struct PointRenderer {
     pipeline: wgpu::RenderPipeline,
-    chunks: Vec<ChunkBuffers>,
+    /// One entry per tile, in the same order as the scene's tiles.
+    tiles: Vec<TileBuffers>,
     uniform_buffer: Buffer,
     bind_group: BindGroup,
+}
+
+/// One tile's data on the GPU.
+struct TileBuffers {
+    chunks: Vec<ChunkBuffers>,
 }
 
 /// One chunk's data on the GPU.
@@ -52,8 +58,9 @@ pub enum ColorMode {
 }
 
 impl PointRenderer {
-    /// Creates the GPU resources once and hands them to egui's renderer.
-    pub fn register(render_state: &egui_wgpu::RenderState, cloud: &Cloud) {
+    /// Creates the GPU resources for a new scene and hands them to egui's renderer,
+    /// replacing the previous scene's.
+    pub fn register(render_state: &egui_wgpu::RenderState, tiles: &[Arc<Tile>]) {
         let device = &render_state.device;
 
         // We compile the shader once from de WGSL file embedded in the binary.
@@ -222,40 +229,7 @@ impl PointRenderer {
             cache: None,
         });
 
-        // Upload every chunk once: two buffers each, straight from the SoA columns.
-        // Upload every chunk once: three buffers each, straight from the SoA columns.
-        let chunks: Vec<ChunkBuffers> = cloud
-            .chunks
-            .iter()
-            .map(|chunk| {
-                // Pack class (bits 0-7) and intensity (bits 16-31) into one u32 per point.
-                let attributes: Vec<u32> = chunk
-                    .classes
-                    .iter()
-                    .zip(&chunk.intensity)
-                    .map(|(&class, &intensity)| u32::from(class) | (u32::from(intensity) << 16))
-                    .collect();
-
-                ChunkBuffers {
-                    positions: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("positions"),
-                        contents: bytemuck::cast_slice(&chunk.positions),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    }),
-                    colors: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("colors"),
-                        contents: bytemuck::cast_slice(&chunk.colors),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    }),
-                    attributes: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("attributes"),
-                        contents: bytemuck::cast_slice(&attributes),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    }),
-                    len: chunk.len() as u32,
-                }
-            })
-            .collect();
+        let tiles = tiles.iter().map(|tile| upload_tile(device, tile)).collect();
 
         // Hand everything to egui's renderer, where `paint` will find it.
         render_state
@@ -264,11 +238,49 @@ impl PointRenderer {
             .callback_resources
             .insert(PointRenderer {
                 pipeline,
-                chunks,
+                tiles,
                 uniform_buffer,
                 bind_group,
             });
     }
+}
+
+/// Uploads every chunk of `tile` once: three buffers each, straight from the SoA columns.
+fn upload_tile(device: &wgpu::Device, tile: &Tile) -> TileBuffers {
+    let chunks = tile
+        .chunks
+        .iter()
+        .map(|chunk| {
+            // Pack class (bits 0-7) and intensity (bits 16-31) into one u32 per point.
+            let attributes: Vec<u32> = chunk
+                .classes
+                .iter()
+                .zip(&chunk.intensity)
+                .map(|(&class, &intensity)| u32::from(class) | (u32::from(intensity) << 16))
+                .collect();
+
+            ChunkBuffers {
+                positions: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("positions"),
+                    contents: bytemuck::cast_slice(&chunk.positions),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }),
+                colors: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("colors"),
+                    contents: bytemuck::cast_slice(&chunk.colors),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }),
+                attributes: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("attributes"),
+                    contents: bytemuck::cast_slice(&attributes),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }),
+                len: chunk.len() as u32,
+            }
+        })
+        .collect();
+
+    TileBuffers { chunks }
 }
 
 /// Attached to a rectangle in the UI; egui calls `paint` each frame.
@@ -327,7 +339,7 @@ impl egui_wgpu::CallbackTrait for PointsCallback {
 
         render_pass.set_pipeline(&renderer.pipeline);
         render_pass.set_bind_group(0, &renderer.bind_group, &[]);
-        for chunk in &renderer.chunks {
+        for chunk in renderer.tiles.iter().flat_map(|tile| &tile.chunks) {
             render_pass.set_vertex_buffer(0, chunk.positions.slice(..));
             render_pass.set_vertex_buffer(1, chunk.colors.slice(..));
             render_pass.set_vertex_buffer(2, chunk.attributes.slice(..)); // ← NEW

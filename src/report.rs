@@ -1,8 +1,4 @@
-use std::time::Duration;
-
-use glam::{DVec3, Vec3};
-
-use crate::cloud::{Cloud, ColorDepth, Stats};
+use crate::cloud::{PointChunk, Stats};
 
 /// Each row of the classes table.
 pub struct ClassRow {
@@ -10,19 +6,6 @@ pub struct ClassRow {
     pub name: &'static str,
     pub count: u64,
     pub percent: f64,
-}
-
-// A Report containing all the important info.
-pub struct Report {
-    pub points: u64,
-    pub origin: DVec3,
-    pub local_min: Vec3,
-    pub local_max: Vec3,
-    pub color_depth: ColorDepth,
-    pub intensity: (u16, u16),
-    pub average_color: Option<[u64; 3]>,
-    pub classes: Vec<ClassRow>,
-    pub elapsed: Duration,
 }
 
 /// Map each class code with its actual class name.
@@ -94,12 +77,13 @@ pub fn class_rows(stats: &Stats) -> Vec<ClassRow> {
     rows
 }
 
-/// Returns the average_color found on the cloud.
-pub fn average_color(cloud: &Cloud) -> Option<[u64; 3]> {
+/// Returns the average colour of the points in `chunks`, which may come from
+/// several tiles.
+pub fn average_color<'a>(chunks: impl IntoIterator<Item = &'a PointChunk>) -> Option<[u64; 3]> {
     let mut sum = [0u64; 3];
     let mut n: u64 = 0;
 
-    for chunk in &cloud.chunks {
+    for chunk in chunks {
         for color in &chunk.colors {
             sum[0] += u64::from(color[0]);
             sum[1] += u64::from(color[1]);
@@ -109,7 +93,7 @@ pub fn average_color(cloud: &Cloud) -> Option<[u64; 3]> {
         }
     }
 
-    if n <= 0 {
+    if n == 0 {
         return None;
     }
 
@@ -135,41 +119,24 @@ pub fn percentile_range(values: &mut [f32], low: f64, high: f64) -> [f32; 2] {
     })
 }
 
-/// Returns the p1-p99 range of the points' heights.
-pub fn height_range(cloud: &Cloud) -> [f32; 2] {
-    let mut heights = cloud
-        .chunks
-        .iter()
+/// Returns the p1-p99 range of the heights of the points in `chunks`, which may
+/// come from several tiles.
+pub fn height_range<'a>(chunks: impl IntoIterator<Item = &'a PointChunk>) -> [f32; 2] {
+    let mut heights = chunks
+        .into_iter()
         .flat_map(|chunk| chunk.positions.iter().map(|position| position[2]))
         .collect::<Vec<f32>>();
 
     percentile_range(&mut heights, 0.01, 0.99)
 }
 
-/// Returns the p2-p98 range of the points' intensities.
-pub fn intensity_range(cloud: &Cloud) -> [f32; 2] {
-    let mut intensities = cloud
-        .chunks
-        .iter()
+/// Returns the p2-p98 range of the intensities of the points in `chunks`, which
+/// may come from several tiles.
+pub fn intensity_range<'a>(chunks: impl IntoIterator<Item = &'a PointChunk>) -> [f32; 2] {
+    let mut intensities = chunks
+        .into_iter()
         .flat_map(|chunk| chunk.intensity.iter().copied().map(f32::from))
         .collect::<Vec<f32>>();
 
     percentile_range(&mut intensities, 0.02, 0.98)
-}
-
-impl Report {
-    /// Create a new [`Report`] containing all the information.
-    pub fn new(cloud: &Cloud, stats: &Stats) -> Self {
-        Self {
-            points: stats.points,
-            origin: cloud.origin,
-            local_min: stats.local_min,
-            local_max: stats.local_max,
-            color_depth: stats.color_depth,
-            intensity: (stats.intensity_min, stats.intensity_max),
-            average_color: average_color(cloud),
-            classes: class_rows(stats),
-            elapsed: stats.elapsed,
-        }
-    }
 }

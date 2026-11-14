@@ -14,10 +14,10 @@ mod render;
 mod report;
 mod scene;
 
-/// Command-line arguments: `brume [--no-vsync] [file.laz]`, flag in any position.
+/// Command-line arguments: `brume [--no-vsync] [tile.laz...]`, flag in any position.
 struct Args {
-    /// File to open at startup. Without it, the window starts empty.
-    path: Option<PathBuf>,
+    /// Files to open at startup, as one scene. Without any, the window starts empty.
+    paths: Vec<PathBuf>,
     /// Present frames without waiting for vsync, so frame times measure Brume
     /// rather than the monitor's refresh rate. For benchmarking only.
     no_vsync: bool,
@@ -29,7 +29,7 @@ fn parse_args() -> Args {
         .partition(|arg| arg == "--no-vsync");
 
     Args {
-        path: positional.into_iter().next().map(PathBuf::from),
+        paths: positional.into_iter().map(PathBuf::from).collect(),
         no_vsync: !flags.is_empty(),
     }
 }
@@ -50,7 +50,7 @@ fn main() -> Result<()> {
         "Brume",
         options,
         Box::new(move |cc| {
-            let app = Brume::new(cc, args.path).ok_or("Brume needs eframe's wgpu backend")?;
+            let app = Brume::new(cc, args.paths).ok_or("Brume needs eframe's wgpu backend")?;
             Ok(Box::new(app))
         }),
     )

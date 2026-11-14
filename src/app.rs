@@ -14,11 +14,11 @@ use eframe::{egui, egui_wgpu};
 
 use crate::{
     camera::{FOV_Y, OrbitCamera},
-    cloud::Cloud,
-    loader::{LoadControl, is_lidar_file, point_count},
+    cloud::Tile,
+    loader::{LoadControl, is_lidar_file},
     perf::FrameTimes,
     render::{ColorMode, PointRenderer, PointsCallback, instances_to_draw},
-    scene::{LoadedScene, load_scene},
+    scene::{LoadPlan, LoadedScene, load_scene},
 };
 
 /// Number of recent frames the performance figures are computed over.
@@ -30,32 +30,32 @@ const LOADING_REFRESH: Duration = Duration::from_millis(50);
 pub struct Brume {
     /// The cloud on screen, if any. It stays there while another file loads.
     scene: Option<Scene>,
-    /// The file being read in the background, if any.
+    /// The files being read in the background, if any.
     pending: Option<PendingLoad>,
     /// The last load error, shown until dismissed or until a load succeeds.
     error: Option<String>,
-    /// A short informational message, such as "only the first dropped file was opened".
+    /// A short informational message, such as "skipped files that aren't LAS/LAZ".
     note: Option<String>,
     view: ViewSettings,
 }
 
-/// A loaded file and the view state that belongs to it.
+/// A loaded scene and the view state that belongs to it.
 struct Scene {
     data: LoadedScene,
     camera: OrbitCamera,
-    path: PathBuf,
 }
 
-/// A file being read by a "brume-loader" thread.
+/// Files being read, one after another, by a "brume-loader" thread.
 ///
 /// Dropping it cancels the load: replacing or clearing [`Brume::pending`] stops
 /// the old thread at its next batch, and its result is never received.
 struct PendingLoad {
     receiver: Receiver<Result<LoadedScene>>,
     control: Arc<LoadControl>,
-    /// Points declared in the file's header.
+    /// Points declared in the headers of all the files.
     total: u64,
-    path: PathBuf,
+    /// Files to read, in order.
+    paths: Vec<PathBuf>,
     started: Instant,
 }
 
@@ -78,8 +78,9 @@ struct ViewSettings {
 }
 
 impl Brume {
-    /// Opens the window, and starts loading `path` in the background if given.
-    pub fn new(cc: &eframe::CreationContext<'_>, path: Option<PathBuf>) -> Option<Self> {
+    /// Opens the window, and starts loading `paths` in the background as one scene
+    /// if there are any.
+    pub fn new(cc: &eframe::CreationContext<'_>, paths: Vec<PathBuf>) -> Option<Self> {
         let render_state = cc.wgpu_render_state.as_ref()?;
         let gpu_info = gpu_info(&render_state.adapter.get_info());
 
@@ -90,32 +91,57 @@ impl Brume {
             note: None,
             view: ViewSettings::new(gpu_info),
         };
-        if let Some(path) = path {
-            app.open(&cc.egui_ctx, path);
+        if !paths.is_empty() {
+            app.open(&cc.egui_ctx, paths);
         }
 
         Some(app)
     }
 
-    /// Starts loading `path`, cancelling any load in progress. The current scene
-    /// stays on screen meanwhile.
+    /// Starts loading `paths` as a new scene, cancelling any load in progress. The
+    /// current scene stays on screen meanwhile.
     ///
-    /// If the new file can't even be opened, the load in progress (if any) carries on.
-    fn open(&mut self, ctx: &egui::Context, path: PathBuf) {
-        if !is_lidar_file(&path) {
-            self.error = Some(format!("Not a LAS/LAZ file: {}", file_name(&path)));
+    /// If the new files can't even be opened, or aren't neighbours, the load in
+    /// progress (if any) carries on.
+    fn open(&mut self, ctx: &egui::Context, paths: Vec<PathBuf>) {
+        let Some(paths) = self.lidar_files(paths) else {
             return;
-        }
+        };
 
-        match PendingLoad::start(ctx, path) {
+        match LoadPlan::new_scene(paths).and_then(|plan| PendingLoad::start(ctx, plan)) {
             Ok(pending) => {
                 // Dropping the old `PendingLoad` cancels it.
                 self.pending = Some(pending);
                 self.error = None;
-                self.note = None;
             }
             Err(error) => self.error = Some(format!("{error:#}")),
         }
+    }
+
+    /// Keeps the LAS/LAZ files of `paths`, made canonical and without duplicates, and
+    /// notes the others. Sets an error and returns `None` if none is left.
+    fn lidar_files(&mut self, paths: Vec<PathBuf>) -> Option<Vec<PathBuf>> {
+        let (lidar, other): (Vec<_>, Vec<_>) =
+            paths.into_iter().partition(|path| is_lidar_file(path));
+
+        if lidar.is_empty() {
+            self.error = Some(format!("Not a LAS/LAZ file: {}", file_names(&other)));
+            return None;
+        }
+        self.note =
+            (!other.is_empty()).then(|| format!("Skipped, not LAS/LAZ: {}", file_names(&other)));
+
+        let mut unique = Vec::with_capacity(lidar.len());
+        for path in lidar {
+            // Canonical paths make the same file dropped twice, or through a
+            // symlink, count once.
+            let path = std::fs::canonicalize(&path).unwrap_or(path);
+            if !unique.contains(&path) {
+                unique.push(path);
+            }
+        }
+
+        Some(unique)
     }
 
     /// Takes the result of the pending load once its thread has sent it.
@@ -132,77 +158,64 @@ impl Brume {
             )),
         };
 
-        let path = pending.path.clone();
         self.pending = None;
 
         match result {
-            Ok(data) => self.show_scene(ctx, frame, data, path),
+            Ok(data) => self.show_scene(ctx, frame, data),
             // The old scene, if any, stays on screen.
-            Err(error) => self.error = Some(format!("{}: {error:#}", file_name(&path))),
+            Err(error) => self.error = Some(format!("{error:#}")),
         }
     }
 
     /// Uploads `data` to the GPU and puts it on screen with a fitted camera.
-    fn show_scene(
-        &mut self,
-        ctx: &egui::Context,
-        frame: &eframe::Frame,
-        data: LoadedScene,
-        path: PathBuf,
-    ) {
+    fn show_scene(&mut self, ctx: &egui::Context, frame: &eframe::Frame, data: LoadedScene) {
         let Some(render_state) = frame.wgpu_render_state() else {
             self.error = Some("Brume needs eframe's wgpu backend".to_owned());
             return;
         };
 
         // Replaces the previous scene's buffers in egui's callback resources.
-        PointRenderer::register(render_state, &data.cloud);
+        PointRenderer::register(render_state, &data.tiles);
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
             "Brume — {}",
-            file_name(&path)
+            scene_name(&data)
         )));
 
-        self.scene = Some(Scene::new(data, path));
+        self.scene = Some(Scene::new(data));
         self.error = None;
     }
 
-    /// Opens the first dropped file that has a path. Opening several tiles at once
-    /// comes in a later step.
+    /// Opens the dropped files as a new scene.
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
         let dropped = ctx.input(|input| input.raw.dropped_files.clone());
         if dropped.is_empty() {
             return;
         }
 
-        let Some(path) = dropped
+        let paths: Vec<PathBuf> = dropped
             .iter()
             .map(|file| file.path())
-            .find(|path| !path.as_os_str().is_empty())
+            .filter(|path| !path.as_os_str().is_empty())
             .map(Path::to_owned)
-        else {
-            self.error = Some("The dropped item is not a file on disk".to_owned());
+            .collect();
+        if paths.is_empty() {
+            self.error = Some("The dropped items are not files on disk".to_owned());
             return;
-        };
-
-        self.open(ctx, path);
-        // `open` leaves `error` empty only if the load started.
-        if dropped.len() > 1 && self.error.is_none() {
-            self.note = Some(format!(
-                "Opened the first of {} files: multiple tiles come later.",
-                dropped.len()
-            ));
         }
+
+        self.open(ctx, paths);
     }
 }
 
 impl PendingLoad {
-    /// Starts reading `path` on a "brume-loader" thread.
+    /// Starts reading the files of `plan` on a "brume-loader" thread.
     ///
-    /// The header is read here, on the UI thread, to know the total for the
-    /// progress bar. It is small, and a missing or invalid file fails right away.
-    fn start(ctx: &egui::Context, path: PathBuf) -> Result<Self> {
+    /// The plan was made on the UI thread from the headers, which are small: a
+    /// missing or invalid file fails before any thread starts.
+    fn start(ctx: &egui::Context, plan: LoadPlan) -> Result<Self> {
         let started = Instant::now();
-        let total = point_count(&path)?;
+        let total = plan.total;
+        let paths = plan.paths.clone();
 
         let (sender, receiver) = mpsc::channel();
         let control = Arc::new(LoadControl::default());
@@ -212,9 +225,8 @@ impl PendingLoad {
             .spawn({
                 let ctx = ctx.clone();
                 let control = Arc::clone(&control);
-                let path = path.clone();
                 move || {
-                    let result = load_scene(&path, &control);
+                    let result = load_scene(&plan, &control);
                     if let Ok(scene) = &result {
                         scene.log();
                     }
@@ -230,14 +242,34 @@ impl PendingLoad {
             receiver,
             control,
             total,
-            path,
+            paths,
             started,
         })
     }
 
-    /// Points read so far.
+    /// Points read so far, across all the files.
     fn read(&self) -> u64 {
         self.control.progress.load(Ordering::Relaxed)
+    }
+
+    /// The file being read: "name" when there is one, "tile i of N: name" otherwise.
+    fn label(&self) -> String {
+        let count = self.paths.len();
+        let index = self
+            .control
+            .tile
+            .load(Ordering::Relaxed)
+            .min(count.saturating_sub(1));
+        let name = self
+            .paths
+            .get(index)
+            .map_or_else(String::new, |path| file_name(path));
+
+        if count == 1 {
+            name
+        } else {
+            format!("tile {} of {count}: {name}", index + 1)
+        }
     }
 }
 
@@ -248,21 +280,22 @@ impl Drop for PendingLoad {
 }
 
 impl Scene {
-    fn new(data: LoadedScene, path: PathBuf) -> Self {
+    /// Puts a new scene on screen, with the camera fitted to the union of its tiles.
+    fn new(data: LoadedScene) -> Self {
         let camera = OrbitCamera::fit(data.stats.local_min, data.stats.local_max, FOV_Y);
 
-        Self { data, camera, path }
+        Self { data, camera }
     }
 
     fn report_ui(&self, ui: &mut egui::Ui) {
         let data = &self.data;
 
-        ui.heading(file_name(&self.path));
+        ui.heading(scene_name(data));
         ui.label(format!(
             "Load time: {:.2} s",
             data.stats.elapsed.as_secs_f64()
         ));
-        ui.label(format!("Origin (UTM): {:.2?}", data.cloud.origin));
+        ui.label(format!("Origin (UTM): {:.2?}", data.origin));
         ui.label(format!("Local min (f32): {:.2?}", data.stats.local_min));
         ui.label(format!("Local max (f32): {:.2?}", data.stats.local_max));
         ui.label(format!("Color depth: {:?}", data.stats.color_depth));
@@ -403,11 +436,12 @@ impl ViewSettings {
         }
     }
 
-    /// Returns how many points [`PointsCallback`] draws at the current `draw_fraction`.
-    fn points_drawn(&self, cloud: &Cloud) -> u64 {
-        cloud
-            .chunks
+    /// Returns how many points [`PointsCallback`] draws from `tiles` at the current
+    /// `draw_fraction`.
+    fn points_drawn(&self, tiles: &[Arc<Tile>]) -> u64 {
+        tiles
             .iter()
+            .flat_map(|tile| &tile.chunks)
             .map(|chunk| u64::from(instances_to_draw(chunk.len() as u32, self.draw_fraction)))
             .sum()
     }
@@ -426,7 +460,7 @@ impl ViewSettings {
         ));
         ui.label(format!("FPS: {}", format_or_dash(fps, 0, "")));
         ui.label(format!("Points: {}", scene.stats.points));
-        ui.label(format!("Points drawn: {}", self.points_drawn(&scene.cloud)));
+        ui.label(format!("Points drawn: {}", self.points_drawn(&scene.tiles)));
         match self.viewport_px {
             Some([width, height]) => ui.label(format!("Viewport: {width:.0} × {height:.0} px")),
             None => ui.label("Viewport: –"),
@@ -444,7 +478,7 @@ fn status_ui(
     note: &mut Option<String>,
 ) -> bool {
     let cancelled = pending.as_ref().is_some_and(|load| {
-        ui.label(format!("Loading {}", file_name(&load.path)));
+        ui.label(format!("Loading {}", load.label()));
         ui.horizontal(|ui| {
             let cancel = ui.button("Cancel").clicked();
             ui.add(egui::ProgressBar::new(fraction(load.read(), load.total)).show_percentage());
@@ -477,7 +511,7 @@ fn empty_ui(
             let cancelled = match pending.as_ref() {
                 Some(load) => loading_ui(ui, load),
                 None => {
-                    ui.heading("Drop a LAS/LAZ file here or use Open…");
+                    ui.heading("Drop LAS/LAZ files here or use Open…");
                     false
                 }
             };
@@ -507,7 +541,7 @@ fn loading_ui(ui: &mut egui::Ui, load: &PendingLoad) -> bool {
         "Computing colour ranges"
     };
 
-    ui.heading(format!("Loading {}", file_name(&load.path)));
+    ui.heading(format!("Loading {}", load.label()));
     ui.add(
         egui::ProgressBar::new(fraction)
             .desired_width(400.0)
@@ -552,24 +586,25 @@ fn drop_overlay(ctx: &egui::Context, rect: egui::Rect) {
         return;
     }
 
-    let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop_overlay"));
+    let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("drop_overlay"));
     let painter = ctx.layer_painter(layer);
     painter.rect_filled(rect, 0.0, egui::Color32::from_black_alpha(180));
     painter.text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
-        "Drop a LAS/LAZ file to open",
+        "Drop LAS/LAZ files to open",
         egui::FontId::proportional(24.0),
         egui::Color32::WHITE,
     );
 }
 
-/// Asks for a file with the system dialog. Blocks the UI until the dialog closes.
-fn pick_file() -> Option<PathBuf> {
+/// Asks for one or more files with the system dialog. Blocks the UI until the
+/// dialog closes.
+fn pick_files() -> Option<Vec<PathBuf>> {
     // Both cases: some dialogs match the filter case-sensitively, and PNOA tiles end in `.LAZ`.
     rfd::FileDialog::new()
         .add_filter("LiDAR", &["las", "laz", "LAS", "LAZ"])
-        .pick_file()
+        .pick_files()
 }
 
 /// Fraction of the points read, for a progress bar.
@@ -579,6 +614,23 @@ fn fraction(read: u64, total: u64) -> f32 {
     } else {
         0.0
     }
+}
+
+/// The file name for a scene of one tile, "N tiles" otherwise.
+fn scene_name(scene: &LoadedScene) -> String {
+    match scene.tiles.as_slice() {
+        [tile] => file_name(&tile.path),
+        tiles => format!("{} tiles", tiles.len()),
+    }
+}
+
+/// The file names of `paths`, separated by commas.
+fn file_names(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| file_name(path))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Returns the last component of `path`, or the whole path if it has none.
@@ -665,8 +717,8 @@ impl eframe::App for Brume {
 
         drop_overlay(&ctx, view_rect);
 
-        if open_clicked && let Some(path) = pick_file() {
-            self.open(&ctx, path);
+        if open_clicked && let Some(paths) = pick_files() {
+            self.open(&ctx, paths);
         }
     }
 }

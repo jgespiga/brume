@@ -81,10 +81,18 @@ Hardware: <CPU model>, <RAM>, <OS>.
 | Points | Load time (s) | Avg frame (ms) | Worst frame (ms) | Resolution | GPU | Vsync |
 | --- | --- | --- | --- | --- | --- | --- |
 | 7,533,341 | 2.15 | 67 | 195 | 2258×1355 | GTX 750 Ti (Vulkan, NVIDIA 550.163.01) | off |
+| 7,533,341 (1 tile) | 2.07 | 65 | 131 | 2133×1355 | GTX 750 Ti (Vulkan, NVIDIA 550.163.01) | off |
+| 17,932,793 (2 tiles) | 5.52 | 152 | 451 | 2125×1355 | GTX 750 Ti (Vulkan, NVIDIA 550.163.01) | off |
+| 26,945,741 (3 tiles) | 8.45 | 227 | 473 | 2125×1355 | GTX 750 Ti (Vulkan, NVIDIA 550.163.01) | off |
 
 Frame times are measured with `--no-vsync` and *Continuous repaint* on, and
 are CPU-side frame intervals (the time between consecutive `ui` calls), not
-GPU execution time.
+GPU execution time. The tile rows have the whole block in view.
+
+Every point is drawn every frame, so frame time grows with the point count:
+about 8.5 ms per million points. Four tiles (34.2 M points, ~650 MiB of vertex
+buffers) don't fit in this 2 GB card next to the desktop; at that rate they
+would take ~290 ms per frame. These are the "before" numbers for phase 3.
 
 ## Roadmap
 

@@ -231,7 +231,8 @@ impl PointRenderer {
 
         let tiles = tiles.iter().map(|tile| upload_tile(device, tile)).collect();
 
-        // Hand everything to egui's renderer, where `paint` will find it.
+        // Hand everything to egui's renderer, where `paint` will find it. This drops
+        // the previous scene's renderer and its buffers.
         render_state
             .renderer
             .write()
@@ -242,6 +243,25 @@ impl PointRenderer {
                 uniform_buffer,
                 bind_group,
             });
+    }
+
+    /// Uploads `tiles` and adds them after the tiles already in the renderer,
+    /// which stay on the GPU untouched. Returns `false` if there is no renderer yet.
+    pub fn append(render_state: &egui_wgpu::RenderState, tiles: &[Arc<Tile>]) -> bool {
+        // Upload before taking the lock, so egui's renderer isn't blocked meanwhile.
+        let uploaded: Vec<TileBuffers> = tiles
+            .iter()
+            .map(|tile| upload_tile(&render_state.device, tile))
+            .collect();
+
+        let mut renderer = render_state.renderer.write();
+        match renderer.callback_resources.get_mut::<PointRenderer>() {
+            Some(points) => {
+                points.tiles.extend(uploaded);
+                true
+            }
+            None => false,
+        }
     }
 }
 

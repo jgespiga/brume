@@ -56,7 +56,18 @@ struct PendingLoad {
     total: u64,
     /// Files to read, in order.
     paths: Vec<PathBuf>,
+    /// Number of tiles in the scene this load adds to, or `None` for a new scene.
+    adds_to: Option<usize>,
     started: Instant,
+}
+
+/// What a file button asked for.
+#[derive(Clone, Copy)]
+enum FileAction {
+    /// Pick files for a new scene.
+    Open,
+    /// Pick files to add to the current scene.
+    Add,
 }
 
 /// View settings and measurements the user chose, independent of the loaded file,
@@ -118,6 +129,51 @@ impl Brume {
         }
     }
 
+    /// Starts loading `paths` as tiles added to the current scene, which keeps its
+    /// origin and camera. Files already in the scene are skipped with a note.
+    /// Without a scene, opens them as a new one.
+    fn add(&mut self, ctx: &egui::Context, paths: Vec<PathBuf>) {
+        if self.scene.is_none() {
+            self.open(ctx, paths);
+            return;
+        }
+        let Some(paths) = self.lidar_files(paths) else {
+            return;
+        };
+        let Some(scene) = &self.scene else {
+            return;
+        };
+
+        let (loaded, fresh): (Vec<_>, Vec<_>) = paths
+            .into_iter()
+            .partition(|path| scene.data.contains(path));
+        let plan = (!fresh.is_empty()).then(|| LoadPlan::add_to(&scene.data, fresh));
+
+        if !loaded.is_empty() {
+            self.add_note(format!("Already loaded: {}.", file_names(&loaded)));
+        }
+        let Some(plan) = plan else {
+            return;
+        };
+
+        match plan.and_then(|plan| PendingLoad::start(ctx, plan)) {
+            Ok(pending) => {
+                // Dropping the old `PendingLoad` cancels it.
+                self.pending = Some(pending);
+                self.error = None;
+            }
+            Err(error) => self.error = Some(format!("{error:#}")),
+        }
+    }
+
+    /// Adds `text` to the note, after what it already says.
+    fn add_note(&mut self, text: String) {
+        self.note = Some(match self.note.take() {
+            Some(note) => format!("{note} {text}"),
+            None => text,
+        });
+    }
+
     /// Keeps the LAS/LAZ files of `paths`, made canonical and without duplicates, and
     /// notes the others. Sets an error and returns `None` if none is left.
     fn lidar_files(&mut self, paths: Vec<PathBuf>) -> Option<Vec<PathBuf>> {
@@ -129,7 +185,7 @@ impl Brume {
             return None;
         }
         self.note =
-            (!other.is_empty()).then(|| format!("Skipped, not LAS/LAZ: {}", file_names(&other)));
+            (!other.is_empty()).then(|| format!("Skipped, not LAS/LAZ: {}.", file_names(&other)));
 
         let mut unique = Vec::with_capacity(lidar.len());
         for path in lidar {
@@ -158,12 +214,14 @@ impl Brume {
             )),
         };
 
+        let adds_to = pending.adds_to;
         self.pending = None;
 
-        match result {
-            Ok(data) => self.show_scene(ctx, frame, data),
+        match (result, adds_to) {
+            (Ok(data), Some(base)) => self.extend_scene(ctx, frame, data, base),
+            (Ok(data), None) => self.show_scene(ctx, frame, data),
             // The old scene, if any, stays on screen.
-            Err(error) => self.error = Some(format!("{error:#}")),
+            (Err(error), _) => self.error = Some(format!("{error:#}")),
         }
     }
 
@@ -176,18 +234,59 @@ impl Brume {
 
         // Replaces the previous scene's buffers in egui's callback resources.
         PointRenderer::register(render_state, &data.tiles);
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
-            "Brume — {}",
-            scene_name(&data)
-        )));
+        set_title(ctx, &data);
 
         self.scene = Some(Scene::new(data));
         self.error = None;
     }
 
-    /// Opens the dropped files as a new scene.
+    /// Puts `data`, the current scene plus new tiles after its first `base` ones, on
+    /// screen. Only the new tiles are uploaded, and the camera stays where it is.
+    fn extend_scene(
+        &mut self,
+        ctx: &egui::Context,
+        frame: &eframe::Frame,
+        data: LoadedScene,
+        base: usize,
+    ) {
+        let Some(render_state) = frame.wgpu_render_state() else {
+            self.error = Some("Brume needs eframe's wgpu backend".to_owned());
+            return;
+        };
+        let Some(scene) = &mut self.scene else {
+            self.show_scene(ctx, frame, data);
+            return;
+        };
+
+        // The renderer holds the current scene's tiles. `data` starts with those same
+        // tiles (shared `Arc`s) unless the scene changed meanwhile; only then, or if
+        // there is no renderer, is everything uploaded again.
+        let same_start = scene.data.tiles.len() == base
+            && scene
+                .data
+                .tiles
+                .iter()
+                .zip(&data.tiles)
+                .all(|(current, loaded)| Arc::ptr_eq(current, loaded));
+        let appended = same_start
+            && data
+                .tiles
+                .get(base..)
+                .is_some_and(|new_tiles| PointRenderer::append(render_state, new_tiles));
+        if !appended {
+            PointRenderer::register(render_state, &data.tiles);
+        }
+        set_title(ctx, &data);
+
+        scene.data = data;
+        self.error = None;
+    }
+
+    /// Opens the dropped files as a new scene, or adds them to the current one if
+    /// Shift is held.
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
-        let dropped = ctx.input(|input| input.raw.dropped_files.clone());
+        let (dropped, shift) =
+            ctx.input(|input| (input.raw.dropped_files.clone(), input.modifiers.shift));
         if dropped.is_empty() {
             return;
         }
@@ -203,7 +302,11 @@ impl Brume {
             return;
         }
 
-        self.open(ctx, paths);
+        if shift {
+            self.add(ctx, paths);
+        } else {
+            self.open(ctx, paths);
+        }
     }
 }
 
@@ -216,6 +319,7 @@ impl PendingLoad {
         let started = Instant::now();
         let total = plan.total;
         let paths = plan.paths.clone();
+        let adds_to = (!plan.existing.is_empty()).then_some(plan.existing.len());
 
         let (sender, receiver) = mpsc::channel();
         let control = Arc::new(LoadControl::default());
@@ -243,6 +347,7 @@ impl PendingLoad {
             control,
             total,
             paths,
+            adds_to,
             started,
         })
     }
@@ -469,14 +574,14 @@ impl ViewSettings {
     }
 }
 
-/// Compact load progress, messages and the "Open…" button, for the section pinned
-/// to the bottom of the side panel. Returns whether "Open…" was clicked.
+/// Compact load progress, messages and the file buttons, for the section pinned
+/// to the bottom of the side panel. Returns the file button clicked, if any.
 fn status_ui(
     ui: &mut egui::Ui,
     pending: &mut Option<PendingLoad>,
     error: &mut Option<String>,
     note: &mut Option<String>,
-) -> bool {
+) -> Option<FileAction> {
     let cancelled = pending.as_ref().is_some_and(|load| {
         ui.label(format!("Loading {}", load.label()));
         ui.horizontal(|ui| {
@@ -493,17 +598,27 @@ fn status_ui(
 
     messages_ui(ui, error, note);
 
-    ui.button("Open…").clicked()
+    ui.horizontal(|ui| {
+        if ui.button("Open…").clicked() {
+            Some(FileAction::Open)
+        } else if ui.button("Add tiles…").clicked() {
+            Some(FileAction::Add)
+        } else {
+            None
+        }
+    })
+    .inner
 }
 
 /// Centred screen shown while there is no scene: load progress or a hint, then
-/// messages and "Open…". Returns whether "Open…" was clicked, and the panel's rect.
+/// messages and the file buttons. Returns the file button clicked, if any, and the
+/// panel's rect.
 fn empty_ui(
     ui: &mut egui::Ui,
     pending: &mut Option<PendingLoad>,
     error: &mut Option<String>,
     note: &mut Option<String>,
-) -> (bool, egui::Rect) {
+) -> (Option<FileAction>, egui::Rect) {
     let panel = egui::CentralPanel::default().show(ui, |ui| {
         ui.vertical_centered(|ui| {
             ui.add_space(ui.available_height() * 0.35);
@@ -522,7 +637,11 @@ fn empty_ui(
             ui.add_space(8.0);
             messages_ui(ui, error, note);
 
-            ui.button("Open…").clicked()
+            let open = ui.button("Open…").clicked();
+            // Nothing to add to yet.
+            ui.add_enabled(false, egui::Button::new("Add tiles…"));
+
+            open.then_some(FileAction::Open)
         })
         .inner
     });
@@ -580,8 +699,9 @@ fn message_ui(ui: &mut egui::Ui, message: &mut Option<String>, color: egui::Colo
     }
 }
 
-/// Darkens `rect` with a hint while files are dragged over the window.
-fn drop_overlay(ctx: &egui::Context, rect: egui::Rect) {
+/// Darkens `rect` with a hint while files are dragged over the window. With a
+/// scene on screen, the hint mentions adding with Shift.
+fn drop_overlay(ctx: &egui::Context, rect: egui::Rect, can_add: bool) {
     if ctx.input(|input| input.raw.hovered_files.is_empty()) {
         return;
     }
@@ -592,7 +712,11 @@ fn drop_overlay(ctx: &egui::Context, rect: egui::Rect) {
     painter.text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
-        "Drop LAS/LAZ files to open",
+        if can_add {
+            "Drop LAS/LAZ files to open them · hold Shift to add them to the scene"
+        } else {
+            "Drop LAS/LAZ files to open them"
+        },
         egui::FontId::proportional(24.0),
         egui::Color32::WHITE,
     );
@@ -622,6 +746,14 @@ fn scene_name(scene: &LoadedScene) -> String {
         [tile] => file_name(&tile.path),
         tiles => format!("{} tiles", tiles.len()),
     }
+}
+
+/// Shows the scene's name in the window title.
+fn set_title(ctx: &egui::Context, scene: &LoadedScene) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
+        "Brume — {}",
+        scene_name(scene)
+    )));
 }
 
 /// The file names of `paths`, separated by commas.
@@ -675,16 +807,16 @@ impl eframe::App for Brume {
             ctx.request_repaint_after(LOADING_REFRESH);
         }
 
-        let (open_clicked, view_rect) = match &mut self.scene {
+        let (file_action, view_rect) = match &mut self.scene {
             Some(scene) => {
                 // Side panel: the report, the controls and performance, scrolling
                 // above a status section pinned to the bottom (load progress,
                 // messages and "Open…"), so that section is always visible.
-                let open = egui::Panel::left("stats_panel")
+                let action = egui::Panel::left("stats_panel")
                     .show(ui, |ui| {
                         // Laid out first so it claims its space at the bottom; the
                         // scroll area then fills what is left.
-                        let open = egui::Panel::bottom("load_status")
+                        let action = egui::Panel::bottom("load_status")
                             .resizable(false)
                             .show(ui, |ui| {
                                 ui.add_space(4.0);
@@ -706,19 +838,29 @@ impl eframe::App for Brume {
                             self.view.perf_ui(ui, &scene.data);
                         });
 
-                        open
+                        action
                     })
                     .inner;
 
-                (open, scene.view_ui(ui, &mut self.view))
+                (action, scene.view_ui(ui, &mut self.view))
             }
             None => empty_ui(ui, &mut self.pending, &mut self.error, &mut self.note),
         };
 
-        drop_overlay(&ctx, view_rect);
+        drop_overlay(&ctx, view_rect, self.scene.is_some());
 
-        if open_clicked && let Some(paths) = pick_files() {
-            self.open(&ctx, paths);
+        match file_action {
+            Some(FileAction::Open) => {
+                if let Some(paths) = pick_files() {
+                    self.open(&ctx, paths);
+                }
+            }
+            Some(FileAction::Add) => {
+                if let Some(paths) = pick_files() {
+                    self.add(&ctx, paths);
+                }
+            }
+            None => {}
         }
     }
 }

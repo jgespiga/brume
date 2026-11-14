@@ -1,5 +1,5 @@
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, atomic::Ordering},
 };
 
@@ -22,6 +22,8 @@ pub const MAX_SCENE_EXTENT: f64 = 50_000.0;
 pub struct LoadedScene {
     /// Global coordinates of the local (0, 0, 0) of every tile.
     pub origin: DVec3,
+    /// Union of the tiles' header bounds, in global coordinates.
+    pub bounds: Bounds,
     pub tiles: Vec<Arc<Tile>>,
     /// Stats of all tiles combined.
     pub stats: Stats,
@@ -34,6 +36,10 @@ pub struct LoadedScene {
 /// What a load will read, decided on the UI thread from the files' headers.
 pub struct LoadPlan {
     pub origin: DVec3,
+    /// Union of the header bounds of every tile in the resulting scene.
+    pub bounds: Bounds,
+    /// Tiles already loaded, which the new ones join. Empty for a new scene.
+    pub existing: Vec<Arc<Tile>>,
     /// Files to read, in order.
     pub paths: Vec<PathBuf>,
     /// Points declared in the headers of `paths`.
@@ -49,6 +55,23 @@ impl LoadPlan {
 
         Ok(Self {
             origin: bounds.origin(),
+            bounds,
+            existing: Vec::new(),
+            paths,
+            total,
+        })
+    }
+
+    /// Plans adding `paths` to `scene`: they share its origin, and together with its
+    /// tiles must still be neighbours.
+    pub fn add_to(scene: &LoadedScene, paths: Vec<PathBuf>) -> Result<Self> {
+        let (bounds, total) = read_headers(&paths, Some(scene.bounds))?;
+        check_extent(bounds)?;
+
+        Ok(Self {
+            origin: scene.origin,
+            bounds,
+            existing: scene.tiles.clone(),
             paths,
             total,
         })
@@ -87,11 +110,13 @@ pub fn check_extent(bounds: Bounds) -> Result<()> {
 }
 
 /// Loads the tiles of `plan` one after another (decompression is already
-/// parallel), all relative to the plan's origin, and combines them.
+/// parallel), all relative to the plan's origin, and combines them with the
+/// plan's existing tiles, which come first and are shared, not copied.
 ///
 /// `control` reports progress across all tiles and allows cancelling; see [`load`].
 pub fn load_scene(plan: &LoadPlan, control: &LoadControl) -> Result<LoadedScene> {
-    let mut tiles = Vec::with_capacity(plan.paths.len());
+    let mut tiles = plan.existing.clone();
+    tiles.reserve(plan.paths.len());
 
     for (index, path) in plan.paths.iter().enumerate() {
         control.tile.store(index, Ordering::Relaxed);
@@ -100,13 +125,13 @@ pub fn load_scene(plan: &LoadPlan, control: &LoadControl) -> Result<LoadedScene>
         tiles.push(Arc::new(tile));
     }
 
-    Ok(LoadedScene::from_tiles(plan.origin, tiles))
+    Ok(LoadedScene::from_tiles(plan.origin, plan.bounds, tiles))
 }
 
 impl LoadedScene {
     /// Combines the stats of `tiles` and computes the report and colour ranges over
     /// all of them.
-    fn from_tiles(origin: DVec3, tiles: Vec<Arc<Tile>>) -> Self {
+    fn from_tiles(origin: DVec3, bounds: Bounds, tiles: Vec<Arc<Tile>>) -> Self {
         let mut stats = Stats::empty();
         for tile in &tiles {
             stats.merge(&tile.stats);
@@ -119,6 +144,7 @@ impl LoadedScene {
 
         Self {
             origin,
+            bounds,
             class_rows: class_rows(&stats),
             tiles,
             stats,
@@ -126,6 +152,11 @@ impl LoadedScene {
             height_range,
             intensity_range,
         }
+    }
+
+    /// Whether a tile was loaded from `path`.
+    pub fn contains(&self, path: &Path) -> bool {
+        self.tiles.iter().any(|tile| tile.path == path)
     }
 
     /// Prints the report to stdout.

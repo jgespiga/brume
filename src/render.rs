@@ -313,6 +313,9 @@ pub struct PointsCallback {
     pub intensity_range: [f32; 2],
     /// Fraction of each chunk to draw (0.01..=1.0). See [`instances_to_draw`].
     pub draw_fraction: f32,
+    /// Whether each tile is drawn, in the renderer's tile order. Tiles without an
+    /// entry are not drawn.
+    pub visible_tiles: Vec<bool>,
 }
 
 /// Number of points drawn from a chunk of `len` points when drawing `fraction` of it.
@@ -359,7 +362,13 @@ impl egui_wgpu::CallbackTrait for PointsCallback {
 
         render_pass.set_pipeline(&renderer.pipeline);
         render_pass.set_bind_group(0, &renderer.bind_group, &[]);
-        for chunk in renderer.tiles.iter().flat_map(|tile| &tile.chunks) {
+        let visible_tiles = renderer
+            .tiles
+            .iter()
+            .zip(&self.visible_tiles)
+            .filter(|&(_, &visible)| visible)
+            .map(|(tile, _)| tile);
+        for chunk in visible_tiles.flat_map(|tile| &tile.chunks) {
             render_pass.set_vertex_buffer(0, chunk.positions.slice(..));
             render_pass.set_vertex_buffer(1, chunk.colors.slice(..));
             render_pass.set_vertex_buffer(2, chunk.attributes.slice(..)); // ← NEW

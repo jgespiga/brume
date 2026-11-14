@@ -14,7 +14,6 @@ use eframe::{egui, egui_wgpu};
 
 use crate::{
     camera::{FOV_Y, OrbitCamera},
-    cloud::Tile,
     loader::{LoadControl, is_lidar_file},
     perf::FrameTimes,
     render::{ColorMode, PointRenderer, PointsCallback, instances_to_draw},
@@ -43,6 +42,8 @@ pub struct Brume {
 struct Scene {
     data: LoadedScene,
     camera: OrbitCamera,
+    /// Whether each tile is drawn, in the same order as `data.tiles`.
+    visible: Vec<bool>,
 }
 
 /// Files being read, one after another, by a "brume-loader" thread.
@@ -279,6 +280,8 @@ impl Brume {
         set_title(ctx, &data);
 
         scene.data = data;
+        // New tiles start visible; the others keep their setting.
+        scene.visible.resize(scene.data.tiles.len(), true);
         self.error = None;
     }
 
@@ -389,7 +392,27 @@ impl Scene {
     fn new(data: LoadedScene) -> Self {
         let camera = OrbitCamera::fit(data.stats.local_min, data.stats.local_max, FOV_Y);
 
-        Self { data, camera }
+        let visible = vec![true; data.tiles.len()];
+
+        Self {
+            data,
+            camera,
+            visible,
+        }
+    }
+
+    /// One row per tile (name, points, load time), with a checkbox that shows or
+    /// hides it.
+    fn tiles_ui(&mut self, ui: &mut egui::Ui) {
+        ui.label("Tiles");
+        egui::Grid::new("tiles").striped(true).show(ui, |ui| {
+            for (tile, visible) in self.data.tiles.iter().zip(&mut self.visible) {
+                ui.checkbox(visible, file_name(&tile.path));
+                ui.label(tile.stats.points.to_string());
+                ui.label(format!("{:.2} s", tile.stats.elapsed.as_secs_f64()));
+                ui.end_row();
+            }
+        });
     }
 
     fn report_ui(&self, ui: &mut egui::Ui) {
@@ -419,11 +442,12 @@ impl Scene {
         if let Some([r, g, b]) = data.average_color {
             ui.label(format!("Average color: rgb({r}, {g}, {b})"));
         }
+    }
 
-        ui.separator();
-
+    /// One row per class in the scene, most common first.
+    fn classes_ui(&self, ui: &mut egui::Ui) {
         egui::Grid::new("classes").striped(true).show(ui, |ui| {
-            for row in &data.class_rows {
+            for row in &self.data.class_rows {
                 ui.label(row.code.to_string());
                 ui.label(row.name);
                 ui.label(row.count.to_string());
@@ -467,6 +491,7 @@ impl Scene {
                         height_range: self.data.height_range,
                         intensity_range: self.data.intensity_range,
                         draw_fraction: view.draw_fraction,
+                        visible_tiles: self.visible.clone(),
                     },
                 ));
             }
@@ -541,17 +566,21 @@ impl ViewSettings {
         }
     }
 
-    /// Returns how many points [`PointsCallback`] draws from `tiles` at the current
-    /// `draw_fraction`.
-    fn points_drawn(&self, tiles: &[Arc<Tile>]) -> u64 {
-        tiles
+    /// Returns how many points [`PointsCallback`] draws from the visible tiles of
+    /// `scene` at the current `draw_fraction`.
+    fn points_drawn(&self, scene: &Scene) -> u64 {
+        scene
+            .data
+            .tiles
             .iter()
-            .flat_map(|tile| &tile.chunks)
+            .zip(&scene.visible)
+            .filter(|&(_, &visible)| visible)
+            .flat_map(|(tile, _)| &tile.chunks)
             .map(|chunk| u64::from(instances_to_draw(chunk.len() as u32, self.draw_fraction)))
             .sum()
     }
 
-    fn perf_ui(&self, ui: &mut egui::Ui, scene: &LoadedScene) {
+    fn perf_ui(&self, ui: &mut egui::Ui, scene: &Scene) {
         let average = self.frame_times.average();
         let fps = average.filter(|&ms| ms > 0.0).map(|ms| 1000.0 / ms);
 
@@ -564,8 +593,8 @@ impl ViewSettings {
             format_or_dash(self.frame_times.max(), 2, " ms")
         ));
         ui.label(format!("FPS: {}", format_or_dash(fps, 0, "")));
-        ui.label(format!("Points: {}", scene.stats.points));
-        ui.label(format!("Points drawn: {}", self.points_drawn(&scene.tiles)));
+        ui.label(format!("Points: {}", scene.data.stats.points));
+        ui.label(format!("Points drawn: {}", self.points_drawn(scene)));
         match self.viewport_px {
             Some([width, height]) => ui.label(format!("Viewport: {width:.0} × {height:.0} px")),
             None => ui.label("Viewport: –"),
@@ -829,13 +858,21 @@ impl eframe::App for Brume {
 
                             ui.separator();
 
+                            scene.tiles_ui(ui);
+
+                            ui.separator();
+
+                            scene.classes_ui(ui);
+
+                            ui.separator();
+
                             self.view.controls_ui(ui);
 
                             ui.separator();
 
                             ui.label("Performance");
                             self.view.perf_controls_ui(ui);
-                            self.view.perf_ui(ui, &scene.data);
+                            self.view.perf_ui(ui, scene);
                         });
 
                         action

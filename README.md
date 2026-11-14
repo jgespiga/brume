@@ -23,12 +23,15 @@ Data: © Instituto Geográfico Nacional, PNOA-LiDAR, CC BY 4.0.
 ```sh
 # Load and print a report
 cargo run --release -- data/tile.laz
+
+# Several neighbouring tiles as one scene
+cargo run --release -- data/tile-a.laz data/tile-b.laz
 ```
 
 ## Design
 
 - **Local coordinates.** UTM northings near Madrid are ~4.46 million metres,
-  where consecutive `f32` values are 0.5 m apart. Brume subtracts a per-file
+  where consecutive `f32` values are 0.5 m apart. Brume subtracts a per-scene
   origin in `f64` and stores `f32` offsets, which keeps ~0.03 mm precision
   within a 1 km tile.
 - **Column storage (SoA).** Positions, colours, classes and intensity live in
@@ -39,6 +42,24 @@ cargo run --release -- data/tile.laz
   files store 0–255. Brume checks the data before converting to 8 bits.
 - **Classification mask.** Legacy point formats pack flags into the class
   byte; Brume masks them out, and keeps the full byte for LAS 1.4 formats.
+
+### Multiple tiles
+
+Several neighbouring tiles can be loaded into one scene: select or drop several
+files at once, or add to the scene on screen with *Add tiles…* or by holding
+Shift while dropping.
+
+- **Shared origin.** All tiles of a scene use one `f64` origin, the centre of
+  the union of their header bounds rounded to whole metres, and store `f32`
+  offsets from it. Tiles added later reuse it, so loaded tiles never move.
+- **Precision.** The spacing between consecutive `f32` values grows with the
+  distance from the origin: about 1 mm at 10 km and 8 mm at 100 km.
+- **50 km check.** A scene may span at most 50 km in X and in Y. Neighbouring
+  tiles fit easily, offsets stay within ~4 mm precision, and a wider set almost
+  certainly mixes coordinate systems: it is rejected from the headers, before
+  any point is read.
+- **One coordinate system.** Tiles from different UTM zones would need
+  reprojecting to a common zone, which Brume does not support.
 
 ## Performance
 

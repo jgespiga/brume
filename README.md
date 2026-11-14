@@ -97,6 +97,6 @@ would take ~290 ms per frame. These are the "before" numbers for phase 3.
 ## Roadmap
 
 - [x] Phase 0: load LAS/LAZ, local coordinates, column storage, statistics
-- [ ] Phase 1: egui window, wgpu point rendering, orbit camera, colour modes
-- [ ] Phase 2: background loading, multiple tiles
+- [x] Phase 1: egui window, wgpu point rendering, orbit camera, colour modes
+- [x] Phase 2: background loading, multiple tiles
 - [ ] Phase 3: octree with level of detail and a point budget

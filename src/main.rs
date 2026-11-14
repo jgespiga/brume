@@ -9,6 +9,7 @@ mod app;
 mod camera;
 mod cloud;
 mod loader;
+mod octree;
 mod perf;
 mod render;
 mod report;

@@ -158,6 +158,9 @@ pub(crate) struct Tile {
     pub stats: Stats,
     /// Level-of-detail octree; its nodes index into the points above.
     pub octree: Octree,
+    /// For each octree depth `d`, how many of the first points belong to levels
+    /// `0..=d`: drawing that prefix draws the tile down to depth `d`.
+    pub points_up_to_depth: Vec<u32>,
     /// Time to build the octree and reorder the points.
     pub octree_time: Duration,
 }

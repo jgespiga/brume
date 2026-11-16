@@ -181,6 +181,7 @@ pub(crate) fn load(path: &Path, origin: DVec3, control: &LoadControl) -> Result<
         path: path.to_owned(),
         points,
         stats,
+        points_up_to_depth: octree.points_up_to_depth(),
         octree,
         octree_time,
     })

@@ -223,6 +223,20 @@ impl Octree {
         Some((Self { nodes }, order))
     }
 
+    /// For each depth `d`, the number of points kept by nodes of depth `0..=d`.
+    /// Nodes are in breadth-first order, so those are the first points: drawing
+    /// that many draws every level down to `d`.
+    pub fn points_up_to_depth(&self) -> Vec<u32> {
+        self.stats()
+            .points_per_level
+            .iter()
+            .scan(0u32, |total, &points| {
+                *total += points as u32;
+                Some(*total)
+            })
+            .collect()
+    }
+
     /// Node and leaf counts, depth, and points per level.
     pub fn stats(&self) -> OctreeStats {
         let max_depth = self.nodes.iter().map(|node| node.depth).max().unwrap_or(0);
@@ -450,6 +464,19 @@ mod tests {
                 points_per_level: vec![1, 1, 1, 997],
             }
         );
+    }
+
+    #[test]
+    fn points_up_to_depth_are_prefix_counts_of_the_levels() {
+        let positions = vec![[3.0, 4.0, 5.0]; 1_000];
+        let params = OctreeParams {
+            grid: 4,
+            max_leaf_points: 10,
+            max_depth: 3,
+        };
+        let (tree, _) = build(&positions, &params);
+
+        assert_eq!(tree.points_up_to_depth(), vec![1, 2, 3, 1_000]);
     }
 
     #[test]

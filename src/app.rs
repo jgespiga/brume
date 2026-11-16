@@ -17,7 +17,7 @@ use crate::{
     loader::{LoadControl, is_lidar_file},
     octree::OctreeStats,
     perf::FrameTimes,
-    render::{ColorMode, PointRenderer, PointsCallback, instances_to_draw},
+    render::{ColorMode, PointRenderer, PointsCallback},
     scene::{LoadPlan, LoadedScene, load_scene},
 };
 
@@ -84,9 +84,9 @@ struct ViewSettings {
     /// The first frame after a measurement starts still spans the idle gap before
     /// it, so it is not recorded.
     skip_next_frame: bool,
-    /// Fraction of each chunk to draw (0.01..=1.0). Benchmarking aid, see
-    /// [`instances_to_draw`].
-    draw_fraction: f32,
+    /// Deepest octree level drawn, or `None` for every level, however deep the
+    /// scene is.
+    max_depth: Option<u8>,
     gpu_info: String,
     /// Size of the 3D view in physical pixels, from the last frame that drew it.
     viewport_px: Option<[f32; 2]>,
@@ -434,6 +434,37 @@ impl Scene {
         }
     }
 
+    /// The deepest octree level among the scene's tiles.
+    fn deepest(&self) -> u8 {
+        let levels = self
+            .data
+            .tiles
+            .iter()
+            .map(|tile| tile.points_up_to_depth.len());
+        levels.max().unwrap_or(1).saturating_sub(1) as u8
+    }
+
+    /// How many points to draw from each tile, in tile order: every level down to
+    /// `max_depth` (all of them for `None`), or 0 for hidden tiles.
+    fn draw_counts(&self, max_depth: Option<u8>) -> Vec<u32> {
+        self.data
+            .tiles
+            .iter()
+            .zip(&self.visible)
+            .map(|(tile, &visible)| {
+                let counts = &tile.points_up_to_depth;
+                let up_to_depth = max_depth
+                    .and_then(|depth| counts.get(usize::from(depth)))
+                    .or(counts.last());
+                if visible {
+                    up_to_depth.copied().unwrap_or(0)
+                } else {
+                    0
+                }
+            })
+            .collect()
+    }
+
     /// One row per tile (name, points, load time, octree build time, nodes and
     /// depth), with a checkbox that shows or hides it, then each tile's points per
     /// octree level.
@@ -552,8 +583,7 @@ impl Scene {
                         color_mode: view.color_mode,
                         height_range: self.data.height_range,
                         intensity_range: self.data.intensity_range,
-                        draw_fraction: view.draw_fraction,
-                        visible_tiles: self.visible.clone(),
+                        draw_counts: self.draw_counts(view.max_depth),
                     },
                 ));
             }
@@ -571,7 +601,7 @@ impl ViewSettings {
             frame_times: FrameTimes::new(FRAME_WINDOW),
             continuous_repaint: false,
             skip_next_frame: false,
-            draw_fraction: 1.0,
+            max_depth: None,
             gpu_info,
             viewport_px: None,
         }
@@ -610,7 +640,8 @@ impl ViewSettings {
         ui.radio_value(&mut self.color_mode, ColorMode::Intensity, "Intensity");
     }
 
-    fn perf_controls_ui(&mut self, ui: &mut egui::Ui) {
+    /// Continuous repaint, and the max octree depth slider, from 0 to `deepest`.
+    fn perf_controls_ui(&mut self, ui: &mut egui::Ui, deepest: u8) {
         let toggled = ui
             .checkbox(&mut self.continuous_repaint, "Continuous repaint")
             .changed();
@@ -619,30 +650,22 @@ impl ViewSettings {
             self.skip_next_frame = true;
         }
 
-        let mut percent = self.draw_fraction * 100.0;
-        let slider = egui::Slider::new(&mut percent, 1.0..=100.0)
-            .integer()
-            .text("Points drawn (%)");
+        // At the scene's deepest level the slider means "everything", so it keeps
+        // drawing every level after loading a deeper scene.
+        let mut depth = self.max_depth.map_or(deepest, |depth| depth.min(deepest));
+        let slider = egui::Slider::new(&mut depth, 0..=deepest).text("Max octree depth");
         if ui.add(slider).changed() {
-            self.draw_fraction = percent / 100.0;
+            self.max_depth = (depth < deepest).then_some(depth);
         }
     }
 
     /// Returns how many points [`PointsCallback`] draws from the visible tiles of
-    /// `scene` at the current `draw_fraction`.
+    /// `scene` at the current `max_depth`.
     fn points_drawn(&self, scene: &Scene) -> u64 {
         scene
-            .data
-            .tiles
-            .iter()
-            .zip(&scene.visible)
-            .filter(|&(_, &visible)| visible)
-            .map(|(tile, _)| {
-                u64::from(instances_to_draw(
-                    tile.points.len() as u32,
-                    self.draw_fraction,
-                ))
-            })
+            .draw_counts(self.max_depth)
+            .into_iter()
+            .map(u64::from)
             .sum()
     }
 
@@ -945,7 +968,7 @@ impl eframe::App for Brume {
                             ui.separator();
 
                             ui.label("Performance");
-                            self.view.perf_controls_ui(ui);
+                            self.view.perf_controls_ui(ui, scene.deepest());
                             self.view.perf_ui(ui, scene);
                         });
 

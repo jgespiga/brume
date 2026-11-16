@@ -8,7 +8,8 @@ use eframe::wgpu::util::DeviceExt;
 use eframe::wgpu::{BindGroup, Buffer};
 use glam::Mat4;
 
-use crate::cloud::Tile;
+use crate::cloud::{PointChunk, Tile};
+use crate::octree::Octree;
 use crate::report::class_color;
 
 /// Bits of depth buffer requested from `eframe`. The pipeline must use the same format.
@@ -297,13 +298,7 @@ fn upload_tile(device: &wgpu::Device, tile: &Tile) -> Result<TileBuffers> {
     check_buffer_size(points.len() as u64, device.limits().max_buffer_size)
         .with_context(|| format!("{} doesn't fit on the GPU", tile.path.display()))?;
 
-    // Pack class (bits 0-7) and intensity (bits 16-31) into one u32 per point.
-    let attributes: Vec<u32> = points
-        .classes
-        .iter()
-        .zip(&points.intensity)
-        .map(|(&class, &intensity)| u32::from(class) | (u32::from(intensity) << 16))
-        .collect();
+    let attributes = pack_attributes(points, &tile.octree);
 
     Ok(TileBuffers {
         positions: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -325,6 +320,29 @@ fn upload_tile(device: &wgpu::Device, tile: &Tile) -> Result<TileBuffers> {
     })
 }
 
+/// Packs class (bits 0-7), octree node depth (bits 8-15) and intensity (bits 16-31)
+/// into one u32 per point. The depth comes from the node ranges of `octree`, whose
+/// node order `points` follows.
+fn pack_attributes(points: &PointChunk, octree: &Octree) -> Vec<u32> {
+    let mut attributes: Vec<u32> = points
+        .classes
+        .iter()
+        .zip(&points.intensity)
+        .map(|(&class, &intensity)| u32::from(class) | (u32::from(intensity) << 16))
+        .collect();
+
+    for node in &octree.nodes {
+        let range = node.first_point as usize..(node.first_point + node.point_count) as usize;
+        if let Some(node_attributes) = attributes.get_mut(range) {
+            for attribute in node_attributes {
+                *attribute |= u32::from(node.depth) << 8;
+            }
+        }
+    }
+
+    attributes
+}
+
 /// Attached to a rectangle in the UI; egui calls `paint` each frame.
 pub struct PointsCallback {
     pub view_proj: Mat4,
@@ -333,19 +351,11 @@ pub struct PointsCallback {
     pub color_mode: ColorMode,
     pub height_range: [f32; 2],
     pub intensity_range: [f32; 2],
-    /// Fraction of each chunk to draw (0.01..=1.0). See [`instances_to_draw`].
-    pub draw_fraction: f32,
-    /// Whether each tile is drawn, in the renderer's tile order. Tiles without an
-    /// entry are not drawn.
-    pub visible_tiles: Vec<bool>,
-}
-
-/// Number of points drawn from a chunk of `len` points when drawing `fraction` of it.
-///
-/// Benchmarking aid: it draws the first part of each chunk, which is file order,
-/// not a spatially uniform subset, so the visible points are not representative.
-pub fn instances_to_draw(len: u32, fraction: f32) -> u32 {
-    ((len as f32 * fraction).ceil() as u32).min(len)
+    /// How many points to draw from the start of each tile's buffers, in the
+    /// renderer's tile order: the points are in breadth-first octree order, so a
+    /// prefix is every level down to some depth. 0 for hidden tiles; tiles without
+    /// an entry are not drawn.
+    pub draw_counts: Vec<u32>,
 }
 
 impl egui_wgpu::CallbackTrait for PointsCallback {
@@ -384,17 +394,15 @@ impl egui_wgpu::CallbackTrait for PointsCallback {
 
         render_pass.set_pipeline(&renderer.pipeline);
         render_pass.set_bind_group(0, &renderer.bind_group, &[]);
-        let visible_tiles = renderer
-            .tiles
-            .iter()
-            .zip(&self.visible_tiles)
-            .filter(|&(_, &visible)| visible)
-            .map(|(tile, _)| tile);
-        for tile in visible_tiles {
+        // One draw call per drawn tile.
+        for (tile, &count) in renderer.tiles.iter().zip(&self.draw_counts) {
+            let instances = count.min(tile.len);
+            if instances == 0 {
+                continue;
+            }
             render_pass.set_vertex_buffer(0, tile.positions.slice(..));
             render_pass.set_vertex_buffer(1, tile.colors.slice(..));
             render_pass.set_vertex_buffer(2, tile.attributes.slice(..));
-            let instances = instances_to_draw(tile.len, self.draw_fraction);
             render_pass.draw(0..4, 0..instances);
         }
     }
@@ -403,6 +411,35 @@ impl egui_wgpu::CallbackTrait for PointsCallback {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attributes_pack_class_depth_and_intensity() {
+        let positions = vec![[3.0, 4.0, 5.0]; 100];
+        let params = crate::octree::OctreeParams {
+            grid: 4,
+            max_leaf_points: 10,
+            max_depth: 2,
+        };
+        let (octree, _) = Octree::build(&positions, &params, || false).expect("not cancelled");
+        let points = PointChunk {
+            positions,
+            classes: vec![6; 100],
+            colors: vec![[0; 4]; 100],
+            intensity: vec![0xABCD; 100],
+        };
+
+        let attributes = pack_attributes(&points, &octree);
+
+        // One point at depth 0, one at depth 1, the remaining 98 at depth 2.
+        let depths: Vec<u32> = attributes.iter().map(|a| (a >> 8) & 0xFF).collect();
+        assert_eq!(&depths[..3], &[0, 1, 2]);
+        assert!(depths[2..].iter().all(|&depth| depth == 2));
+        assert!(
+            attributes
+                .iter()
+                .all(|a| a & 0xFF == 6 && a >> 16 == 0xABCD)
+        );
+    }
 
     #[test]
     fn buffer_size_check_allows_up_to_the_limit() {

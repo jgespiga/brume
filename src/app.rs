@@ -11,18 +11,40 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use eframe::{egui, egui_wgpu};
+use glam::{Mat4, Vec2, Vec3};
 
 use crate::{
-    camera::{FOV_Y, OrbitCamera},
+    camera::{FOV_Y, OrbitCamera, project_to_screen},
     loader::{LoadControl, is_lidar_file},
-    octree::OctreeStats,
+    octree::{Node, OctreeStats},
     perf::FrameTimes,
     render::{ColorMode, PointRenderer, PointsCallback},
+    report::depth_color,
     scene::{LoadPlan, LoadedScene, load_scene},
 };
 
 /// Number of recent frames the performance figures are computed over.
 const FRAME_WINDOW: usize = 120;
+
+/// Most octree node boxes drawn per frame; past it the finest levels are left out.
+const MAX_NODE_BOXES: usize = 5_000;
+
+/// The 12 edges of a cube, as pairs of corner indices. Corner bits: 1 = +x, 2 = +y,
+/// 4 = +z, as for octants.
+const CUBE_EDGES: [(usize, usize); 12] = [
+    (0, 1),
+    (2, 3),
+    (4, 5),
+    (6, 7),
+    (0, 2),
+    (1, 3),
+    (4, 6),
+    (5, 7),
+    (0, 4),
+    (1, 5),
+    (2, 6),
+    (3, 7),
+];
 
 /// How often the window redraws during a load to update the progress bar and elapsed time.
 const LOADING_REFRESH: Duration = Duration::from_millis(50);
@@ -87,6 +109,10 @@ struct ViewSettings {
     /// Deepest octree level drawn, or `None` for every level, however deep the
     /// scene is.
     max_depth: Option<u8>,
+    /// Whether to draw the wireframe box of each octree node over the points.
+    show_nodes: bool,
+    /// Node boxes drawn in the last frame, and whether [`MAX_NODE_BOXES`] cut them.
+    nodes_drawn: (usize, bool),
     gpu_info: String,
     /// Size of the 3D view in physical pixels, from the last frame that drew it.
     viewport_px: Option<[f32; 2]>,
@@ -586,10 +612,75 @@ impl Scene {
                         draw_counts: self.draw_counts(view.max_depth),
                     },
                 ));
+
+                // Painted after the callback, so the boxes are on top of the points.
+                if view.show_nodes {
+                    view.nodes_drawn =
+                        self.node_boxes_ui(ui.painter(), view_proj, rect, view.max_depth);
+                }
             }
         });
 
         panel.response.rect
+    }
+
+    /// Draws the wireframe cube of every node down to `max_depth` of every visible
+    /// tile, coloured by depth, over the 3D view in `rect`. Coarse levels go first,
+    /// so when [`MAX_NODE_BOXES`] is reached the finest ones are left out. Returns
+    /// the boxes drawn and whether the cap was reached.
+    fn node_boxes_ui(
+        &self,
+        painter: &egui::Painter,
+        view_proj: Mat4,
+        rect: egui::Rect,
+        max_depth: Option<u8>,
+    ) -> (usize, bool) {
+        let mut nodes: Vec<&Node> = self
+            .data
+            .tiles
+            .iter()
+            .zip(&self.visible)
+            .filter(|&(_, &visible)| visible)
+            .flat_map(|(tile, _)| &tile.octree.nodes)
+            .filter(|node| max_depth.is_none_or(|depth| node.depth <= depth))
+            .collect();
+        // Stable, so each tile's nodes keep their breadth-first order within a level.
+        nodes.sort_by_key(|node| node.depth);
+
+        let capped = nodes.len() > MAX_NODE_BOXES;
+        for node in nodes.iter().take(MAX_NODE_BOXES) {
+            cube_ui(painter, view_proj, rect, node);
+        }
+
+        (nodes.len().min(MAX_NODE_BOXES), capped)
+    }
+}
+
+/// Draws the edges of `node`'s cube, projected with `view_proj` into `rect`, in the
+/// colour of its depth. Edges with an end behind the camera are left out.
+fn cube_ui(painter: &egui::Painter, view_proj: Mat4, rect: egui::Rect, node: &Node) {
+    let [r, g, b] = depth_color(node.depth);
+    let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(r, g, b));
+    let (rect_min, rect_size) = (
+        Vec2::new(rect.min.x, rect.min.y),
+        Vec2::new(rect.width(), rect.height()),
+    );
+
+    let corners: [Option<egui::Pos2>; 8] = std::array::from_fn(|corner| {
+        let offset = Vec3::new(
+            (corner & 1) as f32,
+            ((corner >> 1) & 1) as f32,
+            ((corner >> 2) & 1) as f32,
+        );
+        let point = node.bounds_min + offset * node.size;
+        project_to_screen(view_proj, point, rect_min, rect_size)
+            .map(|screen| egui::pos2(screen.x, screen.y))
+    });
+
+    for (start, end) in CUBE_EDGES {
+        if let (Some(start), Some(end)) = (corners[start], corners[end]) {
+            painter.line_segment([start, end], stroke);
+        }
     }
 }
 
@@ -602,6 +693,8 @@ impl ViewSettings {
             continuous_repaint: false,
             skip_next_frame: false,
             max_depth: None,
+            show_nodes: false,
+            nodes_drawn: (0, false),
             gpu_info,
             viewport_px: None,
         }
@@ -641,7 +734,8 @@ impl ViewSettings {
         ui.radio_value(&mut self.color_mode, ColorMode::OctreeDepth, "Octree depth");
     }
 
-    /// Continuous repaint, and the max octree depth slider, from 0 to `deepest`.
+    /// Continuous repaint, the max octree depth slider (0 to `deepest`) and the
+    /// node boxes checkbox.
     fn perf_controls_ui(&mut self, ui: &mut egui::Ui, deepest: u8) {
         let toggled = ui
             .checkbox(&mut self.continuous_repaint, "Continuous repaint")
@@ -658,6 +752,8 @@ impl ViewSettings {
         if ui.add(slider).changed() {
             self.max_depth = (depth < deepest).then_some(depth);
         }
+
+        ui.checkbox(&mut self.show_nodes, "Show octree nodes");
     }
 
     /// Returns how many points [`PointsCallback`] draws from the visible tiles of
@@ -685,6 +781,11 @@ impl ViewSettings {
         ui.label(format!("FPS: {}", format_or_dash(fps, 0, "")));
         ui.label(format!("Points: {}", scene.data.stats.points));
         ui.label(format!("Points drawn: {}", self.points_drawn(scene)));
+        if self.show_nodes {
+            let (boxes, capped) = self.nodes_drawn;
+            let capped = if capped { " (capped)" } else { "" };
+            ui.label(format!("Octree nodes drawn: {boxes}{capped}"));
+        }
         match self.viewport_px {
             Some([width, height]) => ui.label(format!("Viewport: {width:.0} × {height:.0} px")),
             None => ui.label("Viewport: –"),

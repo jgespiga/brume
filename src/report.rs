@@ -56,6 +56,36 @@ pub fn class_color(code: u8) -> [u8; 3] {
     }
 }
 
+/// Octree depth drawn at the top of the viridis ramp; deeper nodes look the same.
+/// Matches `DEEPEST_COLOURED_DEPTH` in points.wgsl.
+const DEEPEST_COLOURED_DEPTH: f32 = 15.0;
+
+/// The viridis colour map at `t` (0..1: dark purple, blue, green, yellow), with the
+/// same polynomial fit as `viridis` in points.wgsl.
+pub fn viridis(t: f32) -> [u8; 3] {
+    const C: [[f32; 3]; 7] = [
+        [0.277_727_33, 0.005_407_344_5, 0.334_099_8],
+        [0.105_093_04, 1.404_613_5, 1.384_590_2],
+        [-0.330_861_83, 0.214_847_56, 0.095_095_16],
+        [-4.634_230_5, -5.799_101, -19.332_441],
+        [6.228_27, 14.179_933, 56.690_55],
+        [4.776_385, -13.745_145, -65.353_03],
+        [-5.435_456, 4.645_852_6, 26.312_435],
+    ];
+
+    let t = t.clamp(0.0, 1.0);
+    std::array::from_fn(|channel| {
+        // Horner's method, from the highest power down.
+        let value = C.iter().rev().fold(0.0, |value, c| value * t + c[channel]);
+        (value.clamp(0.0, 1.0) * 255.0).round() as u8
+    })
+}
+
+/// The colour of octree depth `depth`, as the "Octree depth" colour mode draws it.
+pub fn depth_color(depth: u8) -> [u8; 3] {
+    viridis(f32::from(depth) / DEEPEST_COLOURED_DEPTH)
+}
+
 /// Returns each of the classes found in the file. Most common first.
 pub fn class_rows(stats: &Stats) -> Vec<ClassRow> {
     let total = stats.points.max(1) as f64;
@@ -139,4 +169,19 @@ pub fn intensity_range<'a>(chunks: impl IntoIterator<Item = &'a PointChunk>) -> 
         .collect::<Vec<f32>>();
 
     percentile_range(&mut intensities, 0.02, 0.98)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn viridis_goes_from_dark_purple_to_yellow() {
+        // The shader's polynomial at t = 0 and t = 1, as 8-bit colours.
+        assert_eq!(viridis(0.0), [71, 1, 85]);
+        assert_eq!(viridis(1.0), [252, 231, 33]);
+        assert_eq!(viridis(-1.0), viridis(0.0));
+        assert_eq!(depth_color(15), viridis(1.0));
+        assert_eq!(depth_color(40), viridis(1.0));
+    }
 }

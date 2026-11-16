@@ -1,5 +1,5 @@
 use glam::{
-    Mat4, Vec3,
+    Mat4, Vec2, Vec3,
     camera::lh::{proj::directx::perspective, view::look_at_mat4},
 };
 
@@ -30,6 +30,24 @@ pub struct OrbitCamera {
 /// Distance at which a sphere of `radius` fits the vertical field of view `fov_y`.
 pub fn fit_distance(radius: f32, fov_y: f32) -> f32 {
     radius / (fov_y * 0.5).sin()
+}
+
+/// Where `point` lands on screen: projected with `view_proj` and mapped into the
+/// rectangle at `rect_min` of `rect_size`, with screen y growing down. `None` if the
+/// point is behind the camera (clip w <= 0).
+pub fn project_to_screen(
+    view_proj: Mat4,
+    point: Vec3,
+    rect_min: Vec2,
+    rect_size: Vec2,
+) -> Option<Vec2> {
+    let clip = view_proj * point.extend(1.0);
+    if clip.w <= 0.0 {
+        return None;
+    }
+
+    let ndc = clip.truncate().truncate() / clip.w;
+    Some(rect_min + Vec2::new(0.5 + 0.5 * ndc.x, 0.5 - 0.5 * ndc.y) * rect_size)
 }
 
 impl OrbitCamera {
@@ -117,6 +135,32 @@ mod tests {
 
         assert_eq!(camera.target, point);
         assert!((camera.distance - fit_distance(MIN_FIT_RADIUS, FOV_Y)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_target_projects_to_the_centre_of_the_rect() {
+        let mut camera = OrbitCamera::fit(Vec3::splat(-10.0), Vec3::splat(10.0), FOV_Y);
+        camera.yaw = 0.7;
+        camera.pitch = 0.4;
+        let (rect_min, rect_size) = (Vec2::new(300.0, 20.0), Vec2::new(800.0, 600.0));
+        let view_proj = camera.view_proj(rect_size.x / rect_size.y);
+
+        let centre = project_to_screen(view_proj, camera.target, rect_min, rect_size);
+
+        let expected = rect_min + 0.5 * rect_size;
+        assert!(centre.is_some_and(|centre| (centre - expected).length() < 1e-3));
+    }
+
+    #[test]
+    fn points_behind_the_camera_are_not_projected() {
+        let camera = OrbitCamera::fit(Vec3::splat(-10.0), Vec3::splat(10.0), FOV_Y);
+        let behind = camera.eye() + (camera.eye() - camera.target);
+        let view_proj = camera.view_proj(1.0);
+
+        assert_eq!(
+            project_to_screen(view_proj, behind, Vec2::ZERO, Vec2::ONE),
+            None
+        );
     }
 
     #[test]

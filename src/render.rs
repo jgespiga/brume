@@ -1,5 +1,6 @@
 use std::{num::NonZeroU64, sync::Arc};
 
+use anyhow::{Context, Result, bail};
 use bytemuck::{Pod, Zeroable};
 use eframe::egui;
 use eframe::egui_wgpu::{self, wgpu};
@@ -13,6 +14,9 @@ use crate::report::class_color;
 /// Bits of depth buffer requested from `eframe`. The pipeline must use the same format.
 pub const DEPTH_BITS: u8 = 24;
 
+/// Bytes per point of the largest per-point buffer, the positions (3 × f32).
+const MAX_BYTES_PER_POINT: u64 = std::mem::size_of::<[f32; 3]>() as u64;
+
 /// GPU resources for drawing points.
 ///
 /// Stored in egui's renderer, not in the app.
@@ -24,13 +28,8 @@ pub struct PointRenderer {
     bind_group: BindGroup,
 }
 
-/// One tile's data on the GPU.
+/// One tile's points on the GPU: one buffer per attribute, in octree order.
 struct TileBuffers {
-    chunks: Vec<ChunkBuffers>,
-}
-
-/// One chunk's data on the GPU.
-struct ChunkBuffers {
     positions: wgpu::Buffer,
     colors: wgpu::Buffer,
     attributes: wgpu::Buffer,
@@ -60,7 +59,10 @@ pub enum ColorMode {
 impl PointRenderer {
     /// Creates the GPU resources for a new scene and hands them to egui's renderer,
     /// replacing the previous scene's.
-    pub fn register(render_state: &egui_wgpu::RenderState, tiles: &[Arc<Tile>]) {
+    ///
+    /// Fails, leaving the previous scene's resources in place, if a tile doesn't fit
+    /// in the GPU's largest buffer.
+    pub fn register(render_state: &egui_wgpu::RenderState, tiles: &[Arc<Tile>]) -> Result<()> {
         let device = &render_state.device;
 
         // We compile the shader once from de WGSL file embedded in the binary.
@@ -229,7 +231,10 @@ impl PointRenderer {
             cache: None,
         });
 
-        let tiles = tiles.iter().map(|tile| upload_tile(device, tile)).collect();
+        let tiles = tiles
+            .iter()
+            .map(|tile| upload_tile(device, tile))
+            .collect::<Result<_>>()?;
 
         // Hand everything to egui's renderer, where `paint` will find it. This drops
         // the previous scene's renderer and its buffers.
@@ -243,64 +248,81 @@ impl PointRenderer {
                 uniform_buffer,
                 bind_group,
             });
+
+        Ok(())
     }
 
     /// Uploads `tiles` and adds them after the tiles already in the renderer,
-    /// which stay on the GPU untouched. Returns `false` if there is no renderer yet.
-    pub fn append(render_state: &egui_wgpu::RenderState, tiles: &[Arc<Tile>]) -> bool {
+    /// which stay on the GPU untouched. Returns `false` if there is no renderer yet,
+    /// and fails if a tile doesn't fit in the GPU's largest buffer.
+    pub fn append(render_state: &egui_wgpu::RenderState, tiles: &[Arc<Tile>]) -> Result<bool> {
         // Upload before taking the lock, so egui's renderer isn't blocked meanwhile.
-        let uploaded: Vec<TileBuffers> = tiles
+        let uploaded = tiles
             .iter()
             .map(|tile| upload_tile(&render_state.device, tile))
-            .collect();
+            .collect::<Result<Vec<TileBuffers>>>()?;
 
         let mut renderer = render_state.renderer.write();
         match renderer.callback_resources.get_mut::<PointRenderer>() {
             Some(points) => {
                 points.tiles.extend(uploaded);
-                true
+                Ok(true)
             }
-            None => false,
+            None => Ok(false),
         }
     }
 }
 
-/// Uploads every chunk of `tile` once: three buffers each, straight from the SoA columns.
-fn upload_tile(device: &wgpu::Device, tile: &Tile) -> TileBuffers {
-    let chunks = tile
-        .chunks
-        .iter()
-        .map(|chunk| {
-            // Pack class (bits 0-7) and intensity (bits 16-31) into one u32 per point.
-            let attributes: Vec<u32> = chunk
-                .classes
-                .iter()
-                .zip(&chunk.intensity)
-                .map(|(&class, &intensity)| u32::from(class) | (u32::from(intensity) << 16))
-                .collect();
+/// Fails unless a tile of `points` points fits in GPU buffers of at most
+/// `max_buffer_size` bytes (the device's `max_buffer_size` limit).
+pub fn check_buffer_size(points: u64, max_buffer_size: u64) -> Result<()> {
+    let bytes = points.saturating_mul(MAX_BYTES_PER_POINT);
+    if bytes > max_buffer_size {
+        bail!(
+            "its {points} points need a {} MiB position buffer, more than this GPU's maximum \
+             buffer size of {} MiB (at most {} points per tile)",
+            bytes >> 20,
+            max_buffer_size >> 20,
+            max_buffer_size / MAX_BYTES_PER_POINT
+        );
+    }
 
-            ChunkBuffers {
-                positions: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("positions"),
-                    contents: bytemuck::cast_slice(&chunk.positions),
-                    usage: wgpu::BufferUsages::VERTEX,
-                }),
-                colors: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("colors"),
-                    contents: bytemuck::cast_slice(&chunk.colors),
-                    usage: wgpu::BufferUsages::VERTEX,
-                }),
-                attributes: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("attributes"),
-                    contents: bytemuck::cast_slice(&attributes),
-                    usage: wgpu::BufferUsages::VERTEX,
-                }),
-                len: chunk.len() as u32,
-            }
-        })
+    Ok(())
+}
+
+/// Uploads the points of `tile` once: one buffer per attribute, straight from the
+/// SoA columns. Checks the sizes against the device's limit before creating any.
+fn upload_tile(device: &wgpu::Device, tile: &Tile) -> Result<TileBuffers> {
+    let points = &tile.points;
+    check_buffer_size(points.len() as u64, device.limits().max_buffer_size)
+        .with_context(|| format!("{} doesn't fit on the GPU", tile.path.display()))?;
+
+    // Pack class (bits 0-7) and intensity (bits 16-31) into one u32 per point.
+    let attributes: Vec<u32> = points
+        .classes
+        .iter()
+        .zip(&points.intensity)
+        .map(|(&class, &intensity)| u32::from(class) | (u32::from(intensity) << 16))
         .collect();
 
-    TileBuffers { chunks }
+    Ok(TileBuffers {
+        positions: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("positions"),
+            contents: bytemuck::cast_slice(&points.positions),
+            usage: wgpu::BufferUsages::VERTEX,
+        }),
+        colors: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("colors"),
+            contents: bytemuck::cast_slice(&points.colors),
+            usage: wgpu::BufferUsages::VERTEX,
+        }),
+        attributes: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("attributes"),
+            contents: bytemuck::cast_slice(&attributes),
+            usage: wgpu::BufferUsages::VERTEX,
+        }),
+        len: points.len() as u32,
+    })
 }
 
 /// Attached to a rectangle in the UI; egui calls `paint` each frame.
@@ -368,12 +390,26 @@ impl egui_wgpu::CallbackTrait for PointsCallback {
             .zip(&self.visible_tiles)
             .filter(|&(_, &visible)| visible)
             .map(|(tile, _)| tile);
-        for chunk in visible_tiles.flat_map(|tile| &tile.chunks) {
-            render_pass.set_vertex_buffer(0, chunk.positions.slice(..));
-            render_pass.set_vertex_buffer(1, chunk.colors.slice(..));
-            render_pass.set_vertex_buffer(2, chunk.attributes.slice(..)); // ← NEW
-            let instances = instances_to_draw(chunk.len, self.draw_fraction);
+        for tile in visible_tiles {
+            render_pass.set_vertex_buffer(0, tile.positions.slice(..));
+            render_pass.set_vertex_buffer(1, tile.colors.slice(..));
+            render_pass.set_vertex_buffer(2, tile.attributes.slice(..));
+            let instances = instances_to_draw(tile.len, self.draw_fraction);
             render_pass.draw(0..4, 0..instances);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buffer_size_check_allows_up_to_the_limit() {
+        let max = 256 << 20;
+
+        assert!(check_buffer_size(max / MAX_BYTES_PER_POINT, max).is_ok());
+        assert!(check_buffer_size(max / MAX_BYTES_PER_POINT + 1, max).is_err());
+        assert!(check_buffer_size(u64::MAX, max).is_err());
     }
 }

@@ -174,24 +174,21 @@ pub(crate) fn load(path: &Path, origin: DVec3, control: &LoadControl) -> Result<
     stats.elapsed = start.elapsed();
 
     let octree_start = Instant::now();
-    let (chunks, octree) = build_octree(chunks, control)?;
+    let (points, octree) = build_octree(chunks, control)?;
     let octree_time = octree_start.elapsed();
 
     Ok(Tile {
         path: path.to_owned(),
-        chunks,
+        points,
         stats,
         octree,
         octree_time,
     })
 }
 
-/// Builds the octree of the points in `chunks` and returns them reordered by node
-/// (breadth first), in chunks of [`BATCH_SIZE`] like the ones read, with the tree.
-fn build_octree(
-    chunks: Vec<PointChunk>,
-    control: &LoadControl,
-) -> Result<(Vec<PointChunk>, Octree)> {
+/// Builds the octree of the points in `chunks` and returns them joined into
+/// contiguous columns and reordered by node (breadth first), with the tree.
+fn build_octree(chunks: Vec<PointChunk>, control: &LoadControl) -> Result<(PointChunk, Octree)> {
     control.building_octree.store(true, Ordering::Relaxed);
 
     // The build needs all positions in one slice.
@@ -202,11 +199,11 @@ fn build_octree(
     let Some((octree, order)) = built else {
         bail!("load cancelled");
     };
-    let chunks = points.reordered(&order, BATCH_SIZE as usize);
+    let points = points.permuted(&order);
 
     control.building_octree.store(false, Ordering::Relaxed);
 
-    Ok((chunks, octree))
+    Ok((points, octree))
 }
 
 #[cfg(test)]

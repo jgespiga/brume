@@ -36,6 +36,8 @@ pub struct Brume {
     error: Option<String>,
     /// A short informational message, such as "skipped files that aren't LAS/LAZ".
     note: Option<String>,
+    /// The device's largest buffer, in bytes: a tile's points must fit in one.
+    max_buffer_size: u64,
     view: ViewSettings,
 }
 
@@ -96,12 +98,18 @@ impl Brume {
     pub fn new(cc: &eframe::CreationContext<'_>, paths: Vec<PathBuf>) -> Option<Self> {
         let render_state = cc.wgpu_render_state.as_ref()?;
         let gpu_info = gpu_info(&render_state.adapter.get_info());
+        let max_buffer_size = render_state.device.limits().max_buffer_size;
+        println!(
+            "GPU: {gpu_info}, max buffer size {} MiB",
+            max_buffer_size >> 20
+        );
 
         let mut app = Self {
             scene: None,
             pending: None,
             error: None,
             note: None,
+            max_buffer_size,
             view: ViewSettings::new(gpu_info),
         };
         if !paths.is_empty() {
@@ -121,7 +129,9 @@ impl Brume {
             return;
         };
 
-        match LoadPlan::new_scene(paths).and_then(|plan| PendingLoad::start(ctx, plan)) {
+        match LoadPlan::new_scene(paths, self.max_buffer_size)
+            .and_then(|plan| PendingLoad::start(ctx, plan))
+        {
             Ok(pending) => {
                 // Dropping the old `PendingLoad` cancels it.
                 self.pending = Some(pending);
@@ -149,7 +159,8 @@ impl Brume {
         let (loaded, fresh): (Vec<_>, Vec<_>) = paths
             .into_iter()
             .partition(|path| scene.data.contains(path));
-        let plan = (!fresh.is_empty()).then(|| LoadPlan::add_to(&scene.data, fresh));
+        let plan =
+            (!fresh.is_empty()).then(|| LoadPlan::add_to(&scene.data, fresh, self.max_buffer_size));
 
         if !loaded.is_empty() {
             self.add_note(format!("Already loaded: {}.", file_names(&loaded)));
@@ -235,7 +246,10 @@ impl Brume {
         };
 
         // Replaces the previous scene's buffers in egui's callback resources.
-        PointRenderer::register(render_state, &data.tiles);
+        if let Err(error) = PointRenderer::register(render_state, &data.tiles) {
+            self.error = Some(format!("{error:#}"));
+            return;
+        }
         set_title(ctx, &data);
 
         self.scene = Some(Scene::new(data));
@@ -270,13 +284,19 @@ impl Brume {
                 .iter()
                 .zip(&data.tiles)
                 .all(|(current, loaded)| Arc::ptr_eq(current, loaded));
-        let appended = same_start
-            && data
-                .tiles
-                .get(base..)
-                .is_some_and(|new_tiles| PointRenderer::append(render_state, new_tiles));
-        if !appended {
-            PointRenderer::register(render_state, &data.tiles);
+        let appended = match data.tiles.get(base..) {
+            Some(new_tiles) if same_start => PointRenderer::append(render_state, new_tiles),
+            _ => Ok(false),
+        };
+        let uploaded = match appended {
+            Ok(true) => Ok(()),
+            Ok(false) => PointRenderer::register(render_state, &data.tiles),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = uploaded {
+            // The scene on screen, and its buffers, stay as they were.
+            self.error = Some(format!("{error:#}"));
+            return;
         }
         set_title(ctx, &data);
 
@@ -617,8 +637,12 @@ impl ViewSettings {
             .iter()
             .zip(&scene.visible)
             .filter(|&(_, &visible)| visible)
-            .flat_map(|(tile, _)| &tile.chunks)
-            .map(|chunk| u64::from(instances_to_draw(chunk.len() as u32, self.draw_fraction)))
+            .map(|(tile, _)| {
+                u64::from(instances_to_draw(
+                    tile.points.len() as u32,
+                    self.draw_fraction,
+                ))
+            })
             .sum()
     }
 

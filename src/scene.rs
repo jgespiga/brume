@@ -9,6 +9,7 @@ use glam::DVec3;
 use crate::{
     cloud::{Bounds, Stats, Tile},
     loader::{LoadControl, load, read_header_info},
+    render::check_buffer_size,
     report::{ClassRow, average_color, class_rows, height_range, intensity_range},
 };
 
@@ -48,9 +49,10 @@ pub struct LoadPlan {
 
 impl LoadPlan {
     /// Plans a new scene from `paths`: reads every header, checks the tiles are
-    /// neighbours, and puts the origin at the centre of their union.
-    pub fn new_scene(paths: Vec<PathBuf>) -> Result<Self> {
-        let (bounds, total) = read_headers(&paths, None)?;
+    /// neighbours and fit in GPU buffers of `max_buffer_size` bytes, and puts the
+    /// origin at the centre of their union.
+    pub fn new_scene(paths: Vec<PathBuf>, max_buffer_size: u64) -> Result<Self> {
+        let (bounds, total) = read_headers(&paths, None, max_buffer_size)?;
         check_extent(bounds)?;
 
         Ok(Self {
@@ -62,10 +64,11 @@ impl LoadPlan {
         })
     }
 
-    /// Plans adding `paths` to `scene`: they share its origin, and together with its
-    /// tiles must still be neighbours.
-    pub fn add_to(scene: &LoadedScene, paths: Vec<PathBuf>) -> Result<Self> {
-        let (bounds, total) = read_headers(&paths, Some(scene.bounds))?;
+    /// Plans adding `paths` to `scene`: they share its origin, together with its
+    /// tiles must still be neighbours, and must fit in GPU buffers of
+    /// `max_buffer_size` bytes.
+    pub fn add_to(scene: &LoadedScene, paths: Vec<PathBuf>, max_buffer_size: u64) -> Result<Self> {
+        let (bounds, total) = read_headers(&paths, Some(scene.bounds), max_buffer_size)?;
         check_extent(bounds)?;
 
         Ok(Self {
@@ -79,13 +82,20 @@ impl LoadPlan {
 }
 
 /// Reads the headers of `paths`. Returns the union of their bounds (and `start`,
-/// if given) and the sum of their point counts.
-fn read_headers(paths: &[PathBuf], start: Option<Bounds>) -> Result<(Bounds, u64)> {
+/// if given) and the sum of their point counts. Fails if a tile has too many points
+/// for GPU buffers of `max_buffer_size` bytes, before any point is read.
+fn read_headers(
+    paths: &[PathBuf],
+    start: Option<Bounds>,
+    max_buffer_size: u64,
+) -> Result<(Bounds, u64)> {
     let mut union = start;
     let mut total = 0;
 
     for path in paths {
         let header = read_header_info(path)?;
+        check_buffer_size(header.points, max_buffer_size)
+            .with_context(|| format!("{} doesn't fit on the GPU", path.display()))?;
         total += header.points;
         union = Some(union.map_or(header.bounds, |union| union.union(header.bounds)));
     }
@@ -137,7 +147,7 @@ impl LoadedScene {
             stats.merge(&tile.stats);
         }
 
-        let chunks = || tiles.iter().flat_map(|tile| &tile.chunks);
+        let chunks = || tiles.iter().map(|tile| &tile.points);
         let average_color = average_color(chunks());
         let height_range = height_range(chunks());
         let intensity_range = intensity_range(chunks());

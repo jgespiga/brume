@@ -51,18 +51,14 @@ impl PointChunk {
         all
     }
 
-    /// The points in the order given by `order` (indices into this chunk), split
-    /// into chunks of `chunk_size` points; only the last one may be shorter.
-    pub fn reordered(&self, order: &[u32], chunk_size: usize) -> Vec<PointChunk> {
-        order
-            .chunks(chunk_size.max(1))
-            .map(|part| PointChunk {
-                positions: permute(&self.positions, part),
-                classes: permute(&self.classes, part),
-                colors: permute(&self.colors, part),
-                intensity: permute(&self.intensity, part),
-            })
-            .collect()
+    /// The points in the order given by `order` (indices into this chunk).
+    pub fn permuted(&self, order: &[u32]) -> PointChunk {
+        PointChunk {
+            positions: permute(&self.positions, order),
+            classes: permute(&self.classes, order),
+            colors: permute(&self.colors, order),
+            intensity: permute(&self.intensity, order),
+        }
     }
 }
 
@@ -156,10 +152,9 @@ impl Bounds {
 /// Immutable once loaded, and shared between scenes with an `Arc`.
 pub(crate) struct Tile {
     pub path: PathBuf,
-    /// The points in octree order: node by node, breadth first, so coarse levels
-    /// come first. Every chunk has the loader's batch size except the last, so
-    /// point `i` is in chunk `i / batch size`.
-    pub chunks: Vec<PointChunk>,
+    /// All the tile's points, in contiguous columns, in octree order: node by node,
+    /// breadth first, so coarse levels come first.
+    pub points: PointChunk,
     pub stats: Stats,
     /// Level-of-detail octree; its nodes index into the points above.
     pub octree: Octree,

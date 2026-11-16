@@ -42,6 +42,11 @@ cargo run --release -- data/tile-a.laz data/tile-b.laz
   files store 0–255. Brume checks the data before converting to 8 bits.
 - **Classification mask.** Legacy point formats pack flags into the class
   byte; Brume masks them out, and keeps the full byte for LAS 1.4 formats.
+- **One GPU buffer per attribute per tile.** Positions (12 bytes per point),
+  colours (4) and packed class, octree depth and intensity (4) are each one
+  buffer, so a tile must fit in the device's `max_buffer_size`. With wgpu's
+  default of 256 MiB that is 22.3 M points per tile; a larger tile is rejected
+  from its header, before any point is read.
 
 ### Multiple tiles
 

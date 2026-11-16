@@ -32,6 +32,9 @@ var<private> CORNERS: array<vec2<f32>, 4> = array<vec2<f32>, 4>(
     vec2( 1.0,  1.0),
 );
 
+// Octree depth shown as the top of the viridis ramp; deeper nodes look the same.
+const DEEPEST_COLOURED_DEPTH: f32 = 15.0;
+
 // Polynomial fit of matplotlib's viridis colour map (by Matt Zucker, CC0).
 // t in 0..1: dark purple -> blue -> green -> yellow.
 fn viridis(t: f32) -> vec3<f32> {
@@ -45,18 +48,14 @@ fn viridis(t: f32) -> vec3<f32> {
     return c0 + t * (c1 + t * (c2 + t * (c3 + t * (c4 + t * (c5 + t * c6)))));
 }
 
-@vertex
-fn vs_main(@builtin(vertex_index) corner_index: u32, in: VertexIn) -> VertexOut {
-    // Unpack the per-point attributes.
+// The colour of a point in the current colour mode: every mode is here.
+fn point_color(in: VertexIn) -> vec4<f32> {
+    // Unpack the per-point attributes: class | depth << 8 | intensity << 16.
     let classification = in.attributes & 0xFFu;
+    let depth = (in.attributes >> 8u) & 0xFFu;
     let intensity = in.attributes >> 16u;
 
-    // Position: same as before.
-    var clip = camera.view_proj * vec4(in.position, 1.0);
-    let offset = CORNERS[corner_index] * camera.point_size / camera.viewport;
-    clip = vec4(clip.xy + offset * clip.w, clip.z, clip.w);
-
-    // Normalise height and intensity to 0..1 with the ranges from the uniform.
+    // Normalise height, intensity and depth to 0..1.
     let height_t = clamp(
         (in.position.z - camera.height_range.x) / (camera.height_range.y - camera.height_range.x),
         0.0, 1.0,
@@ -65,19 +64,30 @@ fn vs_main(@builtin(vertex_index) corner_index: u32, in: VertexIn) -> VertexOut 
         (f32(intensity) - camera.intensity_range.x) / (camera.intensity_range.y - camera.intensity_range.x),
         0.0, 1.0,
     );
+    let depth_t = clamp(f32(depth) / DEEPEST_COLOURED_DEPTH, 0.0, 1.0);
 
-    // Pick the colour by mode (0 RGB, 1 height, 2 class, 3 intensity).
+    // Pick the colour by mode (0 RGB, 1 height, 2 class, 3 intensity, 4 octree depth).
     var color = in.color;
     switch camera.color_mode {
         case 1u: { color = vec4(viridis(height_t), 1.0); }
         case 2u: { color = class_palette[classification]; }
         case 3u: { color = vec4(vec3(intensity_t), 1.0); }
+        case 4u: { color = vec4(viridis(depth_t), 1.0); }
         default: {}
     }
+    return color;
+}
+
+@vertex
+fn vs_main(@builtin(vertex_index) corner_index: u32, in: VertexIn) -> VertexOut {
+    // Position: a screen-space square around the projected point.
+    var clip = camera.view_proj * vec4(in.position, 1.0);
+    let offset = CORNERS[corner_index] * camera.point_size / camera.viewport;
+    clip = vec4(clip.xy + offset * clip.w, clip.z, clip.w);
 
     var out: VertexOut;
     out.clip = clip;
-    out.color = color;
+    out.color = point_color(in);
     return out;
 }
 

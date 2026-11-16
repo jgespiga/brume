@@ -49,12 +49,16 @@ struct CameraUniform {
     intensity_range: [f32; 2],
 }
 
+/// How points are coloured. The discriminants are the `color_mode` values the
+/// shader switches on, so new modes go at the end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorMode {
     Rgb,
     Height,
     Classification,
     Intensity,
+    /// Depth of the point's octree node, on the viridis ramp.
+    OctreeDepth,
 }
 
 impl PointRenderer {

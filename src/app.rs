@@ -638,6 +638,7 @@ impl ViewSettings {
             "Classification",
         );
         ui.radio_value(&mut self.color_mode, ColorMode::Intensity, "Intensity");
+        ui.radio_value(&mut self.color_mode, ColorMode::OctreeDepth, "Octree depth");
     }
 
     /// Continuous repaint, and the max octree depth slider, from 0 to `deepest`.

@@ -1,3 +1,32 @@
+//! Brume is a LAS/LAZ point cloud viewer built with egui and wgpu.
+//!
+//! Files share a scene origin so the loader can subtract global coordinates in
+//! `f64` before storing local `f32` positions. Each tile owns an octree and point
+//! columns in node order. The UI selects visible node ranges each frame; the GPU
+//! draws those points as instanced squares.
+//!
+//! ```text
+//! UI thread                         brume-loader thread
+//! paths -> LoadPlan ----------------> LAS/LAZ batches
+//!   header and buffer checks              |
+//!                                  local point columns
+//!                                        |
+//!                                  octree + permutation
+//!                                        |
+//! Scene <------- result channel ---- LoadedScene
+//!   |
+//! camera + settings -> LOD selection -> merged ranges
+//!                                        |
+//!                              PointsCallback + tile buffers
+//!                                        |
+//!                                  WGSL -> pixels
+//! ```
+//!
+//! Start at [`app::Brume`] for the application lifecycle. Follow [`scene::LoadPlan`]
+//! and [`loader::load`] for input, [`octree::Octree::build`] for sampling, and
+//! [`lod::select`] for per-frame detail. [`render::PointRenderer`] documents the
+//! GPU layout shared with the embedded `points.wgsl` shader.
+
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -25,6 +54,8 @@ struct Args {
     no_vsync: bool,
 }
 
+/// Recognizes `--no-vsync` anywhere in the argument list and treats every other
+/// argument as a path. File validation belongs to [`Brume`].
 fn parse_args() -> Args {
     let (flags, positional): (Vec<String>, Vec<String>) = std::env::args()
         .skip(1)
@@ -36,6 +67,8 @@ fn parse_args() -> Args {
     }
 }
 
+/// Starts eframe with the depth format required by [`render::PointRenderer`].
+/// [`Brume::new`] rejects a context without the wgpu render state.
 fn main() -> Result<()> {
     let args = parse_args();
 

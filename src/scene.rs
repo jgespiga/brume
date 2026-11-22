@@ -1,3 +1,24 @@
+//! Plan a scene from headers, then assemble it on the loader thread.
+//!
+//! [`LoadPlan`] separates early validation from point decoding. It checks each
+//! tile against [`check_buffer_size`] and the union against [`check_extent`].
+//! These checks happen before [`load_scene`] reads points.
+//!
+//! ```text
+//! new files -> header bounds + point counts -> LoadPlan
+//!                                               |
+//! existing Arc<Tile> entries --------------------+--> load new tiles
+//!                                                        |
+//!                                               merge stats and ranges
+//!                                                        |
+//!                                                   LoadedScene
+//! ```
+//!
+//! [`LoadPlan::new_scene`] chooses a rounded shared origin.
+//! [`LoadPlan::add_to`] preserves the old origin and shares existing tiles, so
+//! their local coordinates and GPU buffers remain valid. The extent check is
+//! a geometric limit, not coordinate-system validation or reprojection.
+
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, atomic::Ordering},
@@ -13,29 +34,36 @@ use crate::{
     report::{ClassRow, average_color, class_rows, height_range, intensity_range},
 };
 
-/// Largest extent a scene may cover in X or Y (metres). Neighbouring tiles fit
-/// easily; anything wider almost certainly mixes coordinate systems.
+/// Largest allowed extent in X or Y, in metres. This bounds horizontal offsets
+/// and rejects widely separated header bounds without decoding points.
 pub const MAX_SCENE_EXTENT: f64 = 50_000.0;
 
 /// Tiles sharing one origin, with everything the viewer derives from all of them.
 ///
-/// Built entirely on the loader thread, so the UI only has to upload it to the GPU.
+/// Built on the loader thread, including report data and colour ranges. The UI
+/// uploads new tiles and creates or updates its camera and visibility state.
 pub struct LoadedScene {
     /// Global coordinates of the local (0, 0, 0) of every tile.
     pub origin: DVec3,
     /// Union of the tiles' header bounds, in global coordinates.
     pub bounds: Bounds,
+    /// Existing shared tiles first, followed by newly loaded tiles.
     pub tiles: Vec<Arc<Tile>>,
     /// Stats of all tiles combined.
     pub stats: Stats,
+    /// Nonempty classes sorted by count for the side panel.
     pub class_rows: Vec<ClassRow>,
+    /// Mean RGB across all points, or no value for an empty scene.
     pub average_color: Option<[u64; 3]>,
+    /// Local height percentiles from [`height_range`], shared by every tile.
     pub height_range: [f32; 2],
+    /// Intensity percentiles from [`intensity_range`], shared by every tile.
     pub intensity_range: [f32; 2],
 }
 
 /// What a load will read, decided on the UI thread from the files' headers.
 pub struct LoadPlan {
+    /// Global position subtracted from every point before converting to `f32`.
     pub origin: DVec3,
     /// Union of the header bounds of every tile in the resulting scene.
     pub bounds: Bounds,
@@ -43,14 +71,13 @@ pub struct LoadPlan {
     pub existing: Vec<Arc<Tile>>,
     /// Files to read, in order.
     pub paths: Vec<PathBuf>,
-    /// Points declared in the headers of `paths`.
+    /// Points declared in the headers of [`LoadPlan::paths`], excluding old tiles.
     pub total: u64,
 }
 
 impl LoadPlan {
-    /// Plans a new scene from `paths`: reads every header, checks the tiles are
-    /// neighbours and fit in GPU buffers of `max_buffer_size` bytes, and puts the
-    /// origin at the centre of their union.
+    /// Reads headers and checks buffer sizes and horizontal extent before any
+    /// point decoding. [`Bounds::origin`] rounds the union's centre to metres.
     pub fn new_scene(paths: Vec<PathBuf>, max_buffer_size: u64) -> Result<Self> {
         let (bounds, total) = read_headers(&paths, None, max_buffer_size)?;
         check_extent(bounds)?;
@@ -64,9 +91,8 @@ impl LoadPlan {
         })
     }
 
-    /// Plans adding `paths` to `scene`: they share its origin, together with its
-    /// tiles must still be neighbours, and must fit in GPU buffers of
-    /// `max_buffer_size` bytes.
+    /// Validates new files against the existing scene's bounds and retains its
+    /// origin. Cloning the [`Arc`] entries shares old points without copying them.
     pub fn add_to(scene: &LoadedScene, paths: Vec<PathBuf>, max_buffer_size: u64) -> Result<Self> {
         let (bounds, total) = read_headers(&paths, Some(scene.bounds), max_buffer_size)?;
         check_extent(bounds)?;
@@ -104,6 +130,7 @@ fn read_headers(
 }
 
 /// Fails unless `bounds` is at most [`MAX_SCENE_EXTENT`] wide in X and in Y.
+/// Does not inspect coordinate-system metadata or constrain the Z extent.
 pub fn check_extent(bounds: Bounds) -> Result<()> {
     let size = bounds.max - bounds.min;
     if size.x > MAX_SCENE_EXTENT || size.y > MAX_SCENE_EXTENT {
@@ -164,7 +191,8 @@ impl LoadedScene {
         }
     }
 
-    /// Whether a tile was loaded from `path`.
+    /// Matches a stored path exactly. The app canonicalizes paths when possible
+    /// before using this check to skip files already in the scene.
     pub fn contains(&self, path: &Path) -> bool {
         self.tiles.iter().any(|tile| tile.path == path)
     }

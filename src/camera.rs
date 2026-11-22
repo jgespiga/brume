@@ -1,3 +1,25 @@
+//! Z-up orbit camera and projection for points and diagnostic overlays.
+//!
+//! [`OrbitCamera`] stores a target and spherical offsets rather than a free
+//! transform. Dragging changes yaw and pitch; scrolling scales the distance.
+//! [`OrbitCamera::view_proj`] uses a left-handed view and DirectX depth range,
+//! which also defines the planes extracted by [`crate::lod::Frustum`].
+//!
+//! ```text
+//! local position -> view matrix -> projection -> clip coordinates
+//!                                                    |
+//!                                               divide by w
+//!                                                    |
+//!                                        normalized device coordinates
+//!                                                    |
+//!                                        viewport mapping, flip screen y
+//!                                                    |
+//!                                              egui position
+//! ```
+//!
+//! [`project_to_screen`] supplies overlay positions; the point shader applies
+//! the same view-projection matrix on the GPU.
+
 use glam::{
     Mat4, Vec2, Vec3,
     camera::lh::{proj::directx::perspective, view::look_at_mat4},
@@ -10,10 +32,9 @@ pub const FOV_Y: f32 = std::f32::consts::FRAC_PI_4;
 /// single point still gets a usable distance.
 const MIN_FIT_RADIUS: f32 = 1.0;
 
-/// A camera that orbits around a target point.
-///
-/// Note that coordinate `Z` is up.
+/// A camera that orbits a scene-relative target with Z as the up axis.
 pub struct OrbitCamera {
+    /// Centre of rotation in the same coordinates as the tile points.
     pub target: Vec3,
     /// Horizontal angle around the target (radians).
     pub yaw: f32,
@@ -51,11 +72,13 @@ pub fn project_to_screen(
 }
 
 impl OrbitCamera {
+    /// Lower drag limit keeps the orbit above the horizontal plane.
     const MIN_PITCH: f32 = 0.05;
-    // Max pitch just under 90º
+    /// Avoids looking exactly along the up axis, where the view basis degenerates.
     const MAX_PITCH: f32 = std::f32::consts::FRAC_PI_2 - 0.05;
 
-    /// Creates a camera that looks at the centre of the box and sees all of it.
+    /// Centres the camera on the box and fits its sphere to the vertical field
+    /// of view. A narrow viewport can still clip the sphere horizontally.
     ///
     /// The box is wrapped in a sphere (radius = half the diagonal), and the zoom
     /// limits scale with that radius.
@@ -80,20 +103,23 @@ impl OrbitCamera {
         self.target + self.distance * direction
     }
 
+    /// Builds a left-handed view-projection matrix with depth in `0..=1`.
+    /// Near and far planes are fixed at 1 and 10,000 metres.
     pub fn view_proj(&self, aspect: f32) -> Mat4 {
         let view = look_at_mat4(self.eye(), self.target, Vec3::Z);
         let projection = perspective(FOV_Y, aspect, 1.0, 10_000.0);
         projection * view
     }
 
-    /// Mouse drag in pixels.
+    /// Converts drag distance to angles and clamps pitch away from the poles.
     pub fn orbit(&mut self, dx: f32, dy: f32) {
         const RADIANS_PER_PIXEL: f32 = 0.005;
         self.yaw -= dx * RADIANS_PER_PIXEL;
         self.pitch = (self.pitch + dy * RADIANS_PER_PIXEL).clamp(Self::MIN_PITCH, Self::MAX_PITCH);
     }
 
-    /// Scroll amount; positive zooms in.
+    /// Scales distance exponentially, so equal scroll amounts give equal zoom
+    /// ratios. Positive input moves closer, within the fitted distance limits.
     pub fn zoom(&mut self, scroll: f32) {
         self.distance =
             (self.distance * (-scroll * 0.002).exp()).clamp(self.min_distance, self.max_distance);

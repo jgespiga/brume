@@ -1,31 +1,64 @@
+//! CPU storage shared by loading, reports and rendering.
+//!
+//! [`Bounds`] keeps header coordinates in `f64`. The loader subtracts the scene
+//! origin before converting positions to `f32`, so large global coordinates do
+//! not consume the precision needed for nearby points.
+//!
+//! ```text
+//! global position, f64 -- subtract shared origin, f64 --> offset, f64
+//!                                                            |
+//!                                                       cast to f32
+//!                                                            |
+//!                                                   PointChunk.positions
+//! ```
+//!
+//! [`Tile`] joins the point columns with their [`Octree`] and [`Stats`]. Loaded
+//! tiles are immutable; [`crate::scene::LoadPlan`] shares them through
+//! [`std::sync::Arc`] when adding files to a scene.
+
 use std::{path::PathBuf, time::Duration};
 
 use glam::{DVec3, Vec3};
 
 use crate::octree::{Octree, permute};
 
+/// Opaque grey for point formats without RGB fields.
 pub(crate) const NO_COLOR: [u8; 4] = [190, 190, 190, 255];
 
-/// SoA representation of a batch of points.
+/// Point attributes in separate columns, a structure of arrays.
 ///
-/// Each one is usually about a million points. It is the
-/// batch we get from [`las::Reader::read_points`] but restructured
-/// with positions relative to the origin in f32 to avoid precission
-/// issues.
+/// The same index addresses one point in every column. Loading visits one
+/// attribute at a time, and rendering uploads positions and colours directly.
+/// Classes and intensities combine with octree depths into a packed GPU column.
 ///
-/// We usually work with one attribute across many points, therefor for
-/// that access pattern SoA is the best option for cache efficiency and
-/// GPU buffers.
+/// ```text
+///                  point i       point i+1
+/// positions     [ [x, y, z]  | [x, y, z]  | ... ]
+/// colors        [ [r,g,b,a]  | [r,g,b,a]  | ... ]
+/// classes       [ class      | class      | ... ]
+/// intensity     [ intensity  | intensity  | ... ]
+///
+/// One struct per point would interleave those attributes instead:
+/// [ position, color, class, intensity | position, color, ... ]
+/// ```
+///
+/// A chunk can hold one decoded batch or an entire tile after
+/// [`PointChunk::concat`]. [`PointChunk::permuted`] must reorder all columns
+/// together to preserve their shared indices.
 #[derive(Debug)]
 pub(crate) struct PointChunk {
-    /// [pos, pos, pos]
+    /// Scene-relative positions in metres.
     pub positions: Vec<[f32; 3]>,
+    /// Classification codes after removing flags from legacy formats.
     pub classes: Vec<u8>,
+    /// RGBA bytes, with opaque alpha and [`NO_COLOR`] where RGB is absent.
     pub colors: Vec<[u8; 4]>,
+    /// Original intensity values, before the shader maps them to grey.
     pub intensity: Vec<u16>,
 }
 
 impl PointChunk {
+    /// Number of points. Every attribute column must have this length.
     pub fn len(&self) -> usize {
         self.positions.len()
     }
@@ -51,7 +84,8 @@ impl PointChunk {
         all
     }
 
-    /// The points in the order given by `order` (indices into this chunk).
+    /// Copies every column through the permutation from [`Octree::build`].
+    /// The original columns remain available until the caller drops them.
     pub fn permuted(&self, order: &[u32]) -> PointChunk {
         PointChunk {
             positions: permute(&self.positions, order),
@@ -62,6 +96,8 @@ impl PointChunk {
     }
 }
 
+/// RGB interpretation inferred from the first decoded batch, or combined across
+/// tiles by [`Stats::merge`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ColorDepth {
     /// The point format has no RGB.
@@ -74,15 +110,25 @@ pub(crate) enum ColorDepth {
     Mixed,
 }
 
+/// Counts and ranges gathered during conversion, before octree construction.
+/// [`Stats::merge`] combines tiles without revisiting their points.
 #[derive(Debug)]
 pub(crate) struct Stats {
+    /// Number of converted points.
     pub points: u64,
+    /// Counts indexed by the full classification byte.
     pub class_counts: [u64; 256],
+    /// RGB interpretation, including mixed depths across tiles.
     pub color_depth: ColorDepth,
+    /// Minimum converted position relative to the scene origin.
     pub local_min: Vec3,
+    /// Maximum converted position relative to the scene origin.
     pub local_max: Vec3,
+    /// Smallest observed intensity.
     pub intensity_min: u16,
+    /// Largest observed intensity.
     pub intensity_max: u16,
+    /// Reading and conversion time, excluding octree building and scene reports.
     pub elapsed: Duration,
 }
 
@@ -124,10 +170,12 @@ impl Stats {
     }
 }
 
-/// An axis-aligned box in global (e.g. UTM) coordinates.
+/// An axis-aligned box in global coordinates, such as UTM metres.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Bounds {
+    /// Minimum global coordinate on each axis.
     pub min: DVec3,
+    /// Maximum global coordinate on each axis.
     pub max: DVec3,
 }
 
@@ -149,17 +197,19 @@ impl Bounds {
 
 /// One LAS/LAZ file, loaded with positions relative to its scene's origin.
 ///
-/// Immutable once loaded, and shared between scenes with an `Arc`.
+/// Immutable once loaded, and shared between scenes with [`std::sync::Arc`].
 pub(crate) struct Tile {
+    /// Source path, used for labels and duplicate detection.
     pub path: PathBuf,
     /// All the tile's points, in contiguous columns, in octree order: node by node,
     /// breadth first, so coarse levels come first.
     pub points: PointChunk,
+    /// Counts and ranges gathered before reordering.
     pub stats: Stats,
-    /// Level-of-detail octree; its nodes index into the points above.
+    /// Spatial hierarchy whose node ranges address [`Tile::points`].
     pub octree: Octree,
-    /// For each octree depth `d`, how many of the first points belong to levels
-    /// `0..=d`: drawing that prefix draws the tile down to depth `d`.
+    /// Prefix counts from [`Octree::points_up_to_depth`]. The app uses this
+    /// vector's length to determine the depth slider's upper limit.
     pub points_up_to_depth: Vec<u32>,
     /// Time to build the octree and reorder the points.
     pub octree_time: Duration,

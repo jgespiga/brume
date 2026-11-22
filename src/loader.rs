@@ -1,3 +1,24 @@
+//! Decode LAS/LAZ points, convert their attributes and build each tile's octree.
+//!
+//! [`load`] runs on the background thread started by [`crate::app::Brume`].
+//! The LAS reader reuses its decoded batch buffer, while converted [`PointChunk`]
+//! columns accumulate until the entire tile is ready for sampling.
+//!
+//! ```text
+//! LAS/LAZ -> reused PointData batch -> local attribute columns
+//!                  ^                         |
+//!                  | next batch              v
+//!                  +------------------ Vec<PointChunk>
+//!                                            |
+//!                                  concat -> Octree::build
+//!                                            |
+//!                                  permute all columns -> Tile
+//! ```
+//!
+//! Batching bounds the decoded buffer, not total tile memory. Concatenation and
+//! permutation allocate new columns. [`LoadControl`] carries progress and
+//! cooperative cancellation without transferring partially loaded tiles.
+
 use std::{
     path::Path,
     sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -13,11 +34,14 @@ use crate::{
     octree::{Octree, OctreeParams},
 };
 
-/// Avoid reading the whole file at once. Instead, we
-/// will read batches of aprox 1 million points.
+/// Points per decoded batch, `2^20`. Reusing the batch avoids allocating a
+/// decoded representation of the entire file at once.
 const BATCH_SIZE: u64 = 1 << 20;
 
 /// Shared between a loader thread and the UI: progress goes out, cancellation comes in.
+///
+/// Relaxed atomics suffice because these fields carry independent progress hints
+/// and a stop request. The result channel transfers the completed scene.
 #[derive(Default)]
 pub(crate) struct LoadControl {
     /// Points read so far, across every tile of the load, updated after each batch.
@@ -40,6 +64,8 @@ pub(crate) fn is_lidar_file(path: &Path) -> bool {
         })
 }
 
+/// Infers RGB depth from the first batch. A channel above 255 selects 16-bit
+/// conversion for the whole file; otherwise the loader treats RGB as 8-bit data.
 fn detect_color_depth(batch: &PointData) -> ColorDepth {
     match batch.rgb() {
         None => ColorDepth::None,
@@ -56,8 +82,9 @@ fn detect_color_depth(batch: &PointData) -> ColorDepth {
 
 /// What a file's header says, read without reading any point.
 pub(crate) struct HeaderInfo {
+    /// Declared count used for progress and GPU buffer checks.
     pub points: u64,
-    /// Bounds of the points, in the file's (global) coordinates.
+    /// Declared bounds in the file's global coordinates.
     pub bounds: Bounds,
 }
 
@@ -78,22 +105,23 @@ pub(crate) fn read_header_info(path: &Path) -> Result<HeaderInfo> {
 }
 
 /// Reads every point of the file into a [`Tile`], with positions relative to
-/// `origin` (global - origin, as f32), and builds its octree.
+/// `origin`. Subtraction happens in `f64` before conversion to `f32`.
 ///
-/// After each batch, the batch's points are added to `control.progress`, so
-/// another thread can show how far a load of one or several tiles has got. If
-/// `control.cancel` is set, the load stops there and returns a "load cancelled" error.
+/// After each batch, [`LoadControl::progress`] includes the converted points.
+/// [`LoadControl::cancel`] stops work at a batch boundary or before an octree
+/// node. Concatenation, permutation and report calculations do not check it.
+/// Read errors and cancellation return no partial [`Tile`].
 pub(crate) fn load(path: &Path, origin: DVec3, control: &LoadControl) -> Result<Tile> {
     let start = Instant::now();
 
-    // Create las reader.
     let mut reader = las::Reader::from_path(path)?;
     let n_points = reader.header().number_of_points();
 
-    // Calculate the number of batches we are going to process.
     let n_batches = n_points.div_ceil(BATCH_SIZE) as usize;
 
     let extended = reader.header().point_format().is_extended;
+    // Legacy formats share the classification byte with flags. Extended formats
+    // give the code a full byte, so their upper bits must survive.
     let class_mask: u8 = if extended { 0xFF } else { 0x1F };
 
     let mut chunks = Vec::with_capacity(n_batches);
@@ -187,8 +215,10 @@ pub(crate) fn load(path: &Path, origin: DVec3, control: &LoadControl) -> Result<
     })
 }
 
-/// Builds the octree of the points in `chunks` and returns them joined into
-/// contiguous columns and reordered by node (breadth first), with the tree.
+/// Joins batches and applies the order from [`Octree::build`] to every column.
+/// The tree indexes the reordered points, so both must leave this function
+/// together. [`LoadControl::building_octree`] covers concatenation and reordering
+/// as well as tree construction.
 fn build_octree(chunks: Vec<PointChunk>, control: &LoadControl) -> Result<(PointChunk, Octree)> {
     control.building_octree.store(true, Ordering::Relaxed);
 

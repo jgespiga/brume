@@ -1,3 +1,25 @@
+//! GPU storage and egui callbacks for instanced point rendering.
+//!
+//! [`PointRenderer`] lives in egui_wgpu's callback resources so [`PointsCallback`]
+//! can access it during painting. Each tile uploads once, in octree point order;
+//! each frame supplies uniforms and the ranges chosen by [`crate::lod::select`].
+//!
+//! ```text
+//! Tile.points       GPU vertex buffers       shader inputs per instance
+//! positions ------> f32 x 3 ----------------> location 0
+//! colors ---------> unorm8 x 4 -------------> location 1
+//! classes ------+
+//! intensity ----+-> packed u32 -------------> location 2
+//! octree depth -+
+//!
+//! camera + colour ranges -> uniform binding 0
+//! class + depth palettes -> uniform binding 1
+//! ```
+//!
+//! [`egui_wgpu::CallbackTrait::paint`] binds a tile's columns once and draws each merged
+//! range as instances of a four-vertex triangle strip. The shader expands the
+//! point in screen space; depth testing keeps nearer squares in front.
+
 use std::{num::NonZeroU64, ops::Range, sync::Arc};
 
 use anyhow::{Context, Result, bail};
@@ -20,32 +42,57 @@ const MAX_BYTES_PER_POINT: u64 = std::mem::size_of::<[f32; 3]>() as u64;
 
 /// GPU resources for drawing points.
 ///
-/// Stored in egui's renderer, not in the app.
+/// [`PointRenderer::register`] replaces the scene's resources only after all
+/// uploads succeed. [`PointRenderer::append`] retains existing tile buffers.
 pub struct PointRenderer {
+    /// Instanced triangle strips with depth writes and a strict less-than test.
     pipeline: wgpu::RenderPipeline,
     /// One entry per tile, in the same order as the scene's tiles.
     tiles: Vec<TileBuffers>,
+    /// Camera and colour settings updated by [`egui_wgpu::CallbackTrait::prepare`].
     uniform_buffer: Buffer,
+    /// Camera and palette bindings shared by all tiles.
     bind_group: BindGroup,
 }
 
 /// One tile's points on the GPU: one buffer per attribute, in octree order.
 struct TileBuffers {
+    /// Scene-relative positions in the order defined by [`Octree`].
     positions: wgpu::Buffer,
+    /// RGBA bytes that the vertex format normalizes to floats.
     colors: wgpu::Buffer,
+    /// Classification, depth and intensity packed by [`pack_attributes`].
     attributes: wgpu::Buffer,
+    /// Instance count, used to clamp submitted draw ranges.
     len: u32,
 }
 
-/// Must match `struct Camera` in points.wgsl byte for byte (96 bytes).
+/// Matches `Camera` in `points.wgsl` byte for byte, with a total of 96 bytes.
+/// The matrix uses column order, as returned by [`Mat4::to_cols_array_2d`].
+///
+/// ```text
+/// Bytes    Field
+///  0..64   view-projection matrix
+/// 64..72   viewport
+/// 72..76   point size
+/// 76..80   colour mode
+/// 80..88   height range
+/// 88..96   intensity range
+/// ```
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct CameraUniform {
+    /// Scene-relative coordinates to clip coordinates.
     view_proj: [[f32; 4]; 4],
+    /// Physical viewport dimensions for clip-space square offsets.
     viewport: [f32; 2],
+    /// Full square edge length in physical pixels.
     point_size: f32,
+    /// Numeric selector shared with [`ColorMode`] and the shader switch.
     color_mode: u32,
+    /// Local height endpoints for normalization.
     height_range: [f32; 2],
+    /// Intensity endpoints for normalization.
     intensity_range: [f32; 2],
 }
 
@@ -53,11 +100,15 @@ struct CameraUniform {
 /// shader switches on, so new modes go at the end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorMode {
+    /// RGB from the file, or the loader's fallback grey.
     Rgb,
+    /// Local height on a viridis scale between scene percentiles.
     Height,
+    /// Class code mapped through [`class_color`].
     Classification,
+    /// Intensity as grey between scene percentiles.
     Intensity,
-    /// Depth of the point's octree node, on the viridis ramp.
+    /// Owning node's depth, using the cyclic palette from [`depth_color`].
     OctreeDepth,
 }
 
@@ -70,14 +121,13 @@ impl PointRenderer {
     pub fn register(render_state: &egui_wgpu::RenderState, tiles: &[Arc<Tile>]) -> Result<()> {
         let device = &render_state.device;
 
-        // We compile the shader once from de WGSL file embedded in the binary.
+        // Embedding the shader keeps the executable independent of source paths.
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("points"),
             source: wgpu::ShaderSource::Wgsl(include_str!("points.wgsl").into()),
         });
 
-        // How the GPU reads each buffer: bytes per point and value types.
-        // The `location`'s match the `@location(n)` inputs in the shader.
+        // Legacy layout declaration. The active pipeline declares its buffers below.
         let vertex_layouts = [
             Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress, // 12
@@ -173,7 +223,6 @@ impl PointRenderer {
 
         let depth_format = egui_wgpu::depth_format_from_bits(DEPTH_BITS, 0);
 
-        // The pipeline: shaders + fixed settings.
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("points"),
             layout: Some(&pipeline_layout),
@@ -202,7 +251,7 @@ impl PointRenderer {
                             shader_location: 1,
                         }],
                     }),
-                    // 2: attributes (class | intensity << 16)  ← NEW
+                    // One packed integer preserves class, depth and intensity bits.
                     Some(wgpu::VertexBufferLayout {
                         array_stride: std::mem::size_of::<u32>() as wgpu::BufferAddress,
                         step_mode: wgpu::VertexStepMode::Instance,
@@ -297,8 +346,9 @@ pub fn check_buffer_size(points: u64, max_buffer_size: u64) -> Result<()> {
     Ok(())
 }
 
-/// Uploads the points of `tile` once: one buffer per attribute, straight from the
-/// SoA columns. Checks the sizes against the device's limit before creating any.
+/// Uploads positions and colours directly, and packs the remaining attributes
+/// with [`pack_attributes`]. Checks the largest column against the device limit
+/// before creating buffers.
 fn upload_tile(device: &wgpu::Device, tile: &Tile) -> Result<TileBuffers> {
     let points = &tile.points;
     check_buffer_size(points.len() as u64, device.limits().max_buffer_size)
@@ -329,6 +379,13 @@ fn upload_tile(device: &wgpu::Device, tile: &Tile) -> Result<TileBuffers> {
 /// Packs class (bits 0-7), octree node depth (bits 8-15) and intensity (bits 16-31)
 /// into one u32 per point. The depth comes from the node ranges of `octree`, whose
 /// node order `points` follows.
+///
+/// ```text
+/// 31                    16 15             8 7              0
+/// +-----------------------+----------------+----------------+
+/// | intensity, 16 bits    | depth, 8 bits  | class, 8 bits  |
+/// +-----------------------+----------------+----------------+
+/// ```
 fn pack_attributes(points: &PointChunk, octree: &Octree) -> Vec<u32> {
     let mut attributes: Vec<u32> = points
         .classes
@@ -349,13 +406,20 @@ fn pack_attributes(points: &PointChunk, octree: &Octree) -> Vec<u32> {
     attributes
 }
 
-/// Attached to a rectangle in the UI; egui calls `paint` each frame.
+/// Per-frame commands for the view rectangle. [`egui_wgpu::CallbackTrait::prepare`]
+/// writes uniforms; [`egui_wgpu::CallbackTrait::paint`] uses the stored tile buffers.
 pub struct PointsCallback {
+    /// Current camera matrix, even when the LOD selection is frozen.
     pub view_proj: Mat4,
+    /// View rectangle size in physical pixels for screen-space point sizes.
     pub viewport: [f32; 2],
+    /// Square edge length in physical pixels.
     pub point_size: f32,
+    /// Shader colour selector matching [`ColorMode`].
     pub color_mode: ColorMode,
+    /// Scene-wide local height endpoints for the viridis scale.
     pub height_range: [f32; 2],
+    /// Scene-wide intensity endpoints for the grey scale.
     pub intensity_range: [f32; 2],
     /// The point ranges to draw from each tile's buffers, in the renderer's tile
     /// order: one per selected octree node, with touching ranges merged. Each range
@@ -364,6 +428,8 @@ pub struct PointsCallback {
 }
 
 impl egui_wgpu::CallbackTrait for PointsCallback {
+    /// Updates the shared uniform buffer before painting; no extra command
+    /// buffers are needed because the queue performs the write.
     fn prepare(
         &self,
         _device: &wgpu::Device,
@@ -387,6 +453,8 @@ impl egui_wgpu::CallbackTrait for PointsCallback {
         Vec::new()
     }
 
+    /// Draws selected instances in egui's render pass. Each tile binds once,
+    /// then each merged range produces one four-vertex instanced draw.
     fn paint(
         &self,
         _info: egui::PaintCallbackInfo,

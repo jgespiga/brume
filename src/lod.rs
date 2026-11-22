@@ -1,3 +1,29 @@
+//! Choose visible octree samples within one point budget across all tiles.
+//!
+//! [`select`] ranks candidates by projected cube size using one [`BinaryHeap`].
+//! Children enter the heap only after their parent is selected, because each
+//! [`Node`] owns a separate sample. Refinement adds points to the parent sample.
+//!
+//! ```text
+//! visible roots inside frustum -> shared heap
+//!                                    |
+//!                         pop largest projected cube <-------+
+//!                                    |                       |
+//!                         fits remaining budget?             |
+//!                          no |             | yes            |
+//!                            stop        select node         |
+//!                                           |                |
+//!                              cells exceed pixel threshold? |
+//!                                           | yes            |
+//!                              queue eligible children ------+
+//!
+//! selected node indices -> sort per tile -> merge touching point ranges
+//! ```
+//!
+//! The budget stops selection at the first node that does not fit. It does not
+//! split that sample or search for a smaller candidate. [`draw_ranges`] converts
+//! the result into instance ranges for [`crate::render::PointsCallback`].
+
 use std::{cmp::Ordering, collections::BinaryHeap, ops::Range};
 
 use glam::{Mat4, Vec3, Vec4};
@@ -12,12 +38,14 @@ const MIN_DISTANCE: f32 = 0.01;
 /// inwards and normalised, so `normal · p + d` is the signed distance of `p`.
 #[derive(Clone, Copy, Debug)]
 pub struct Frustum {
+    /// Left, right, bottom, top, near and far planes with inward normals.
     planes: [Vec4; 6],
 }
 
 impl Frustum {
-    /// Extracts the planes from `view_proj` (Gribb–Hartmann), for a projection with
-    /// the WebGPU/DirectX depth range: inside means -w <= x, y <= w and 0 <= z <= w.
+    /// Uses Gribb-Hartmann plane extraction with the WebGPU/DirectX depth range.
+    /// Inside means `-w <= x, y <= w` and `0 <= z <= w` in clip coordinates.
+    /// The near plane therefore comes from the z row alone, not w plus z.
     pub fn from_view_proj(view_proj: Mat4) -> Self {
         let [x, y, z, w] = [0, 1, 2, 3].map(|row| view_proj.row(row));
         let planes = [w + x, w - x, w + y, w - y, z, w - z].map(|plane| {
@@ -30,6 +58,18 @@ impl Frustum {
 
     /// Whether the box from `min` to `max` may be in view. Conservative: it can
     /// return `true` for some boxes just outside, never `false` for a visible one.
+    ///
+    /// For each plane, the p-vertex maximizes the signed distance over the box.
+    /// If even that corner has a negative signed distance, the whole box is outside.
+    /// Passing every plane can still be a false positive.
+    ///
+    /// ```text
+    /// outside                   plane    inside
+    /// +---------+                 |       normal ->
+    /// | box     p                 |
+    /// +---------+                 |
+    ///           p has negative signed distance: reject the whole box
+    /// ```
     pub fn intersects_aabb(&self, min: Vec3, max: Vec3) -> bool {
         self.planes.iter().all(|plane| {
             // The box corner furthest along the plane's normal (the "p-vertex"):
@@ -90,11 +130,11 @@ pub struct Selection {
     pub per_tile: Vec<Vec<u32>>,
     /// Points in the selected nodes.
     pub points: u64,
+    /// Total selected nodes across all tiles, before merging draw ranges.
     pub nodes: u32,
 }
 
-/// A node's priority: its projected size in pixels. Ordered with `total_cmp`, so it
-/// can go in a `BinaryHeap`.
+/// Projected cube size ordered with [`f32::total_cmp`] for use in [`BinaryHeap`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Priority(f32);
 
@@ -115,8 +155,11 @@ impl PartialOrd for Priority {
 /// A node waiting in the heap; the largest priority comes out first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Candidate {
+    /// Largest projected size leaves the heap first.
     priority: Priority,
+    /// Tile index in the caller's list, retained even for hidden tiles.
     tile: usize,
+    /// Arena index within that tile's [`Octree`].
     node: u32,
 }
 
@@ -132,8 +175,8 @@ fn node_box(node: &Node) -> (Vec3, Vec3) {
 /// exist, are in the frustum, are not deeper than `params.max_depth`, and the node's
 /// own sampling is still coarser than `params.min_cell_px` (its grid cell, `size /
 /// grid`, projected in pixels). Selection stops at the first node whose points
-/// would exceed `params.point_budget`, so the budget is never exceeded; if even a
-/// root is over budget, the selection is empty.
+/// would exceed [`LodParams::point_budget`]. If the first candidate root is over
+/// budget, selection is empty even if other roots would fit.
 ///
 /// `tiles` pairs each tile's octree with whether the tile is visible.
 pub fn select(

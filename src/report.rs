@@ -1,14 +1,36 @@
+//! Summaries and colour scales derived from loaded points.
+//!
+//! [`class_rows`] uses counts collected by the loader. [`height_range`] and
+//! [`intensity_range`] copy one attribute across all tiles, then select
+//! percentile endpoints without sorting the entire copy. The shader clamps
+//! values outside those endpoints so outliers do not set the colour scale.
+//!
+//! ```text
+//! Stats.class_counts -----------------------> class rows
+//! all tile heights -> select percentiles ---> shared height range
+//! all intensities  -> select percentiles ---> shared intensity range
+//! class_color + depth_color ----------------> GPU palettes
+//! ```
+//!
+//! [`crate::scene::LoadedScene`] computes reports during loading. Palette
+//! functions also supply the UI legend and octree box colours.
+
 use crate::cloud::{PointChunk, Stats};
 
-/// Each row of the classes table.
+/// One nonempty classification in the scene-wide report.
 pub struct ClassRow {
+    /// Classification byte after the loader removes legacy flags.
     pub code: u8,
+    /// Display label from [`class_name`].
     pub name: &'static str,
+    /// Points assigned to this class.
     pub count: u64,
+    /// Share of all scene points, expressed as a percentage.
     pub percent: f64,
 }
 
-/// Map each class code with its actual class name.
+/// Labels the supported class codes, including survey-specific codes.
+/// Unlisted codes use "Other" without changing the stored code.
 pub fn class_name(code: u8) -> &'static str {
     match code {
         1 => "Unclassified",
@@ -60,9 +82,8 @@ pub fn class_color(code: u8) -> [u8; 3] {
 /// Matches the length of `depths` in `Palettes` in points.wgsl.
 pub const DEPTH_PALETTE_LEN: usize = 8;
 
-/// The depth colours: the Okabe-Ito palette, which stays distinguishable with the
-/// common kinds of colour blindness, with its black replaced by light grey to show
-/// on the dark background. Ordered so neighbouring depths contrast.
+/// Okabe-Ito depth colours with black replaced by light grey for the dark
+/// background. Adjacent entries give neighbouring depths different colours.
 const DEPTH_COLORS: [[u8; 3]; DEPTH_PALETTE_LEN] = [
     [86, 180, 233],  // sky blue
     [230, 159, 0],   // orange
@@ -80,7 +101,8 @@ pub fn depth_color(depth: u8) -> [u8; 3] {
     DEPTH_COLORS[usize::from(depth) % DEPTH_PALETTE_LEN]
 }
 
-/// Returns each of the classes found in the file. Most common first.
+/// Builds rows from [`Stats::class_counts`], omitting zero counts and sorting
+/// the most common classes first. An empty scene produces no rows.
 pub fn class_rows(stats: &Stats) -> Vec<ClassRow> {
     let total = stats.points.max(1) as f64;
     let mut rows: Vec<ClassRow> = stats
@@ -102,7 +124,8 @@ pub fn class_rows(stats: &Stats) -> Vec<ClassRow> {
 }
 
 /// Returns the average colour of the points in `chunks`, which may come from
-/// several tiles.
+/// several tiles. Uses integer division and includes fallback colours for points
+/// without RGB. Returns `None` when there are no points.
 pub fn average_color<'a>(chunks: impl IntoIterator<Item = &'a PointChunk>) -> Option<[u64; 3]> {
     let mut sum = [0u64; 3];
     let mut n: u64 = 0;
@@ -125,8 +148,9 @@ pub fn average_color<'a>(chunks: impl IntoIterator<Item = &'a PointChunk>) -> Op
     Some([avg[0], avg[1], avg[2]])
 }
 
-/// Returns the values at the `low` and `high` percentiles (0.0..=1.0).
-/// Reorders `values` in place.
+/// Selects rounded ranks for percentiles in `0.0..=1.0`, with `low <= high`.
+/// [`slice::select_nth_unstable_by`] partitions in place without a full sort.
+/// Empty input returns `[0.0, 1.0]`; constant input can return equal endpoints.
 pub fn percentile_range(values: &mut [f32], low: f64, high: f64) -> [f32; 2] {
     debug_assert!(low <= high && (0.0..=1.0).contains(&low) && (0.0..=1.0).contains(&high));
 

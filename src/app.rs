@@ -1,3 +1,28 @@
+//! Application state, background loading and per-frame view selection.
+//!
+//! [`Brume`] keeps the current [`Scene`] visible while [`PendingLoad`] owns a
+//! receiver for the next scene. Header checks run on the UI thread; decoding,
+//! octree construction and reports run on the named loader thread.
+//!
+//! ```text
+//! UI thread                                 brume-loader thread
+//! LoadPlan -> PendingLoad::start ----------> load_scene
+//!                   |                            |
+//!                   |<---- mpsc result ----------+
+//! poll_pending -----+
+//!      |
+//!      +-> register all tiles, or append new tiles -> Scene
+//!
+//! PendingLoad::drop ---- cancel flag ------> batch / node checks
+//! progress display <--- progress atomics --- loader
+//! ```
+//!
+//! Dropping [`PendingLoad`] requests cancellation without joining the thread.
+//! The old result receiver disappears, so a superseded load cannot replace the
+//! scene. [`Brume::extend_scene`] checks shared tile identity before reusing GPU
+//! buffers. [`Scene::view_ui`] then selects nodes, merges ranges and schedules a
+//! [`PointsCallback`]. Optional wireframes use the egui painter after the points.
+
 use std::{
     ops::Range,
     path::{Path, PathBuf},
@@ -51,6 +76,8 @@ const CUBE_EDGES: [(usize, usize); 12] = [
 /// How often the window redraws during a load to update the progress bar and elapsed time.
 const LOADING_REFRESH: Duration = Duration::from_millis(50);
 
+/// eframe application with separate displayed and pending scenes.
+/// [`Brume::poll_pending`] receives results without blocking the UI.
 pub struct Brume {
     /// The cloud on screen, if any. It stays there while another file loads.
     scene: Option<Scene>,
@@ -62,14 +89,17 @@ pub struct Brume {
     note: Option<String>,
     /// The device's largest buffer, in bytes: a tile's points must fit in one.
     max_buffer_size: u64,
+    /// Controls retained when the user opens another scene.
     view: ViewSettings,
 }
 
 /// A loaded scene and the view state that belongs to it.
 struct Scene {
+    /// Shared tile data and reports prepared by the loader.
     data: LoadedScene,
+    /// Current view, preserved when tiles are appended.
     camera: OrbitCamera,
-    /// Whether each tile is drawn, in the same order as `data.tiles`.
+    /// Whether each tile participates in selection, in [`LoadedScene::tiles`] order.
     visible: Vec<bool>,
     /// The selection kept while "Freeze LOD" is on.
     frozen: Option<FrozenLod>,
@@ -78,15 +108,20 @@ struct Scene {
 /// A level-of-detail selection kept while the camera moves, with the camera it was
 /// made for.
 struct FrozenLod {
+    /// Captured node indices, reused until the user unfreezes LOD.
     selection: Selection,
+    /// Matrix used for the captured selection and its frustum overlay.
     view_proj: Mat4,
 }
 
 /// What the last frame's level-of-detail selection drew.
 #[derive(Clone, Copy, Default)]
 struct LodStats {
+    /// Selected samples across all tiles.
     nodes: u32,
+    /// Sum of the selected nodes' point counts.
     points: u64,
+    /// Merged ranges submitted to the renderer.
     draw_calls: usize,
     /// CPU time of the selection, or `None` when it was frozen.
     select_time: Option<Duration>,
@@ -94,10 +129,13 @@ struct LodStats {
 
 /// Files being read, one after another, by a "brume-loader" thread.
 ///
-/// Dropping it cancels the load: replacing or clearing [`Brume::pending`] stops
-/// the old thread at its next batch, and its result is never received.
+/// Replacing or clearing [`Brume::pending`] sets [`LoadControl::cancel`]. The
+/// loader checks it at batch and octree node boundaries. This does not interrupt
+/// work inside a batch or join the thread; the UI drops the result receiver.
 struct PendingLoad {
+    /// One completed scene or error, transferred by the worker thread.
     receiver: Receiver<Result<LoadedScene>>,
+    /// Progress hints and a cooperative stop request shared with the worker.
     control: Arc<LoadControl>,
     /// Points declared in the headers of all the files.
     total: u64,
@@ -105,6 +143,7 @@ struct PendingLoad {
     paths: Vec<PathBuf>,
     /// Number of tiles in the scene this load adds to, or `None` for a new scene.
     adds_to: Option<usize>,
+    /// Start time for the live progress display, including report computation.
     started: Instant,
 }
 
@@ -120,9 +159,13 @@ enum FileAction {
 /// View settings and measurements the user chose, independent of the loaded file,
 /// so they survive a reload.
 struct ViewSettings {
+    /// Screen-space square size passed to the shader.
     point_size: f32,
+    /// Attribute-to-colour mapping chosen by the user.
     color_mode: ColorMode,
+    /// Recent intervals between UI calls during continuous repaint.
     frame_times: FrameTimes,
+    /// Requests another frame even when no input changes the view.
     continuous_repaint: bool,
     /// The first frame after a measurement starts still spans the idle gap before
     /// it, so it is not recorded.
@@ -136,12 +179,14 @@ struct ViewSettings {
     min_cell_px: f32,
     /// Keep the last selection while the camera moves.
     freeze_lod: bool,
+    /// Counters for the last view selection and merged ranges.
     lod_stats: LodStats,
     /// Whether to draw the wireframe box of each selected octree node over the points,
     /// and the frozen frustum while "Freeze LOD" is on.
     show_nodes: bool,
     /// Node boxes drawn in the last frame, and whether [`MAX_NODE_BOXES`] cut them.
     nodes_drawn: (usize, bool),
+    /// Adapter and driver label shown alongside the measurements.
     gpu_info: String,
     /// Size of the 3D view in physical pixels, from the last frame that drew it.
     viewport_px: Option<[f32; 2]>,
@@ -268,7 +313,8 @@ impl Brume {
         Some(unique)
     }
 
-    /// Takes the result of the pending load once its thread has sent it.
+    /// Polls the result channel with [`Receiver::try_recv`]. An empty channel
+    /// leaves the scene unchanged; a disconnected channel becomes a load error.
     fn poll_pending(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         let Some(pending) = &self.pending else {
             return;
@@ -470,6 +516,7 @@ impl PendingLoad {
 }
 
 impl Drop for PendingLoad {
+    /// Requests cancellation without waiting for the loader to reach a check.
     fn drop(&mut self) {
         self.control.cancel.store(true, Ordering::Relaxed);
     }
@@ -490,7 +537,8 @@ impl Scene {
         }
     }
 
-    /// The deepest octree level among the scene's tiles.
+    /// Uses cached prefix-vector lengths to bound the "Max octree depth" slider.
+    /// The renderer still draws the ranges chosen by [`crate::lod::select`].
     fn deepest(&self) -> u8 {
         let levels = self
             .data
@@ -578,9 +626,9 @@ impl Scene {
             .collect()
     }
 
-    /// One row per tile (name, points, load time, octree build time, nodes and
-    /// depth), with a checkbox that shows or hides it, then each tile's points per
-    /// octree level.
+    /// Shows per-tile load and tree statistics with visibility controls.
+    /// Expandable level counts let the reader inspect how sampling distributes
+    /// points across the tree.
     fn tiles_ui(&mut self, ui: &mut egui::Ui) {
         let octrees: Vec<OctreeStats> = self
             .data
@@ -621,6 +669,7 @@ impl Scene {
         }
     }
 
+    /// Displays scene-wide ranges and statistics, including hidden tiles.
     fn report_ui(&self, ui: &mut egui::Ui) {
         let data = &self.data;
 
@@ -663,7 +712,9 @@ impl Scene {
         });
     }
 
-    /// The 3D view in the central panel. Returns the panel's rect.
+    /// Handles orbit and zoom, then schedules points and optional wireframes.
+    /// Converts egui dimensions to physical pixels for LOD and point sizing.
+    /// Returns the panel rectangle for the file-drop overlay.
     fn view_ui(&mut self, ui: &mut egui::Ui, view: &mut ViewSettings) -> egui::Rect {
         let panel = egui::CentralPanel::default().show(ui, |ui| {
             let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::drag());
@@ -812,6 +863,8 @@ fn wireframe_ui(
 }
 
 impl ViewSettings {
+    /// Sets the initial display and LOD controls, with timing disabled until the
+    /// user enables continuous repaint.
     fn new(gpu_info: String) -> Self {
         Self {
             point_size: 2.0,
@@ -871,8 +924,8 @@ impl ViewSettings {
         }
     }
 
-    /// Continuous repaint, the level-of-detail settings (max octree depth from 0 to
-    /// `deepest`, point budget, min cell size, freeze) and the node boxes checkbox.
+    /// Edits the selection limits and diagnostic overlays. Enabling continuous
+    /// repaint clears old intervals and skips the interval spanning idle time.
     fn perf_controls_ui(&mut self, ui: &mut egui::Ui, deepest: u8) {
         let toggled = ui
             .checkbox(&mut self.continuous_repaint, "Continuous repaint")
@@ -882,8 +935,8 @@ impl ViewSettings {
             self.skip_next_frame = true;
         }
 
-        // At the scene's deepest level the slider means "everything", so it keeps
-        // drawing every level after loading a deeper scene.
+        // At the highest setting, remove the depth cap so a deeper scene can
+        // refine further without another slider change. Other LOD limits remain.
         let mut depth = self.max_depth.map_or(deepest, |depth| depth.min(deepest));
         let slider = egui::Slider::new(&mut depth, 0..=deepest).text("Max octree depth");
         if ui.add(slider).changed() {
@@ -903,6 +956,8 @@ impl ViewSettings {
         ui.checkbox(&mut self.show_nodes, "Show octree nodes");
     }
 
+    /// Displays CPU intervals, selection cost and submitted draw counts alongside
+    /// adapter and viewport details needed to interpret measurements.
     fn perf_ui(&self, ui: &mut egui::Ui, scene: &Scene) {
         let average = self.frame_times.average();
         let fps = average.filter(|&ms| ms > 0.0).map(|ms| 1000.0 / ms);
@@ -1172,6 +1227,9 @@ fn format_or_dash(value: Option<f32>, decimals: usize, unit: &str) -> String {
 }
 
 impl eframe::App for Brume {
+    /// Receives load results before laying out the side panel and view. The
+    /// bottom status panel claims space first so file actions remain visible
+    /// while the report scrolls above it.
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 

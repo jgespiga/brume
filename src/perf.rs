@@ -1,8 +1,22 @@
+//! Recent CPU frame intervals for the performance panel.
+//!
+//! [`FrameTimes`] keeps a bounded ring in a [`VecDeque`]. The app records samples
+//! only during continuous repaint and skips the first interval after enabling
+//! it, which would otherwise include idle time. These are intervals between UI
+//! calls, not GPU execution timings.
+//!
+//! ```text
+//! oldest -> [ interval | interval | interval ] <- newest
+//!              pop front when full    push back next sample
+//! ```
+
 use std::collections::VecDeque;
 
 /// Rolling window of the most recent frame durations, in milliseconds.
 pub struct FrameTimes {
+    /// Intervals in chronological order, from oldest to newest.
     samples: VecDeque<f32>,
+    /// Maximum samples retained; zero disables storage.
     capacity: usize,
 }
 

@@ -56,34 +56,28 @@ pub fn class_color(code: u8) -> [u8; 3] {
     }
 }
 
-/// Octree depth drawn at the top of the viridis ramp; deeper nodes look the same.
-/// Matches `DEEPEST_COLOURED_DEPTH` in points.wgsl.
-const DEEPEST_COLOURED_DEPTH: f32 = 15.0;
+/// Number of distinct octree depth colours; deeper levels reuse them in a cycle.
+/// Matches the length of `depths` in `Palettes` in points.wgsl.
+pub const DEPTH_PALETTE_LEN: usize = 8;
 
-/// The viridis colour map at `t` (0..1: dark purple, blue, green, yellow), with the
-/// same polynomial fit as `viridis` in points.wgsl.
-pub fn viridis(t: f32) -> [u8; 3] {
-    const C: [[f32; 3]; 7] = [
-        [0.277_727_33, 0.005_407_344_5, 0.334_099_8],
-        [0.105_093_04, 1.404_613_5, 1.384_590_2],
-        [-0.330_861_83, 0.214_847_56, 0.095_095_16],
-        [-4.634_230_5, -5.799_101, -19.332_441],
-        [6.228_27, 14.179_933, 56.690_55],
-        [4.776_385, -13.745_145, -65.353_03],
-        [-5.435_456, 4.645_852_6, 26.312_435],
-    ];
+/// The depth colours: the Okabe-Ito palette, which stays distinguishable with the
+/// common kinds of colour blindness, with its black replaced by light grey to show
+/// on the dark background. Ordered so neighbouring depths contrast.
+const DEPTH_COLORS: [[u8; 3]; DEPTH_PALETTE_LEN] = [
+    [86, 180, 233],  // sky blue
+    [230, 159, 0],   // orange
+    [0, 158, 115],   // bluish green
+    [204, 121, 167], // reddish purple
+    [240, 228, 66],  // yellow
+    [0, 114, 178],   // blue
+    [213, 94, 0],    // vermillion
+    [220, 220, 220], // light grey
+];
 
-    let t = t.clamp(0.0, 1.0);
-    std::array::from_fn(|channel| {
-        // Horner's method, from the highest power down.
-        let value = C.iter().rev().fold(0.0, |value, c| value * t + c[channel]);
-        (value.clamp(0.0, 1.0) * 255.0).round() as u8
-    })
-}
-
-/// The colour of octree depth `depth`, as the "Octree depth" colour mode draws it.
+/// Maps each octree depth to the colour it is drawn with, in the "Octree depth"
+/// colour mode and the node box overlay.
 pub fn depth_color(depth: u8) -> [u8; 3] {
-    viridis(f32::from(depth) / DEEPEST_COLOURED_DEPTH)
+    DEPTH_COLORS[usize::from(depth) % DEPTH_PALETTE_LEN]
 }
 
 /// Returns each of the classes found in the file. Most common first.
@@ -176,12 +170,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn viridis_goes_from_dark_purple_to_yellow() {
-        // The shader's polynomial at t = 0 and t = 1, as 8-bit colours.
-        assert_eq!(viridis(0.0), [71, 1, 85]);
-        assert_eq!(viridis(1.0), [252, 231, 33]);
-        assert_eq!(viridis(-1.0), viridis(0.0));
-        assert_eq!(depth_color(15), viridis(1.0));
-        assert_eq!(depth_color(40), viridis(1.0));
+    fn depth_colors_are_distinct_and_cycle() {
+        let first: Vec<[u8; 3]> = (0..DEPTH_PALETTE_LEN as u8).map(depth_color).collect();
+        for (i, a) in first.iter().enumerate() {
+            assert!(
+                first[i + 1..].iter().all(|b| a != b),
+                "depth {i} is repeated"
+            );
+        }
+
+        assert_eq!(depth_color(8), depth_color(0));
+        assert_eq!(depth_color(13), depth_color(5));
     }
 }

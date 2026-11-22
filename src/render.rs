@@ -10,7 +10,7 @@ use glam::Mat4;
 
 use crate::cloud::{PointChunk, Tile};
 use crate::octree::Octree;
-use crate::report::class_color;
+use crate::report::{DEPTH_PALETTE_LEN, class_color, depth_color};
 
 /// Bits of depth buffer requested from `eframe`. The pipeline must use the same format.
 pub const DEPTH_BITS: u8 = 24;
@@ -113,7 +113,7 @@ impl PointRenderer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
                         min_binding_size: NonZeroU64::new(
-                            (256 * std::mem::size_of::<[f32; 4]>()) as u64,
+                            ((256 + DEPTH_PALETTE_LEN) * std::mem::size_of::<[f32; 4]>()) as u64,
                         ),
                     },
                     count: None,
@@ -135,10 +135,12 @@ impl PointRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        // Class palette: 256 RGBA colours, one per possible class code.
+        // Palettes, laid out like `Palettes` in points.wgsl: 256 class colours, one
+        // per possible class code, then the octree depth colours. RGBA, one vec4 each.
         let palette: Vec<[f32; 4]> = (0..=255u8)
-            .map(|code| {
-                let [r, g, b] = class_color(code);
+            .map(class_color)
+            .chain((0..DEPTH_PALETTE_LEN as u8).map(depth_color))
+            .map(|[r, g, b]| {
                 [
                     f32::from(r) / 255.0,
                     f32::from(g) / 255.0,
@@ -149,7 +151,7 @@ impl PointRenderer {
             .collect();
 
         let palette_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("class palette"),
+            label: Some("palettes"),
             contents: bytemuck::cast_slice(&palette),
             usage: wgpu::BufferUsages::UNIFORM, // never changes: no COPY_DST
         });

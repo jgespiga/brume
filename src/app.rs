@@ -656,6 +656,20 @@ impl Scene {
     }
 }
 
+/// One row per octree depth from 0 to `deepest`: a square in the depth's colour
+/// and "Depth N".
+fn depth_legend_ui(ui: &mut egui::Ui, deepest: u8) {
+    for depth in 0..=deepest {
+        ui.horizontal(|ui| {
+            let [r, g, b] = depth_color(depth);
+            let (square, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+            ui.painter()
+                .rect_filled(square, 2.0, egui::Color32::from_rgb(r, g, b));
+            ui.label(format!("Depth {depth}"));
+        });
+    }
+}
+
 /// Draws the edges of `node`'s cube, projected with `view_proj` into `rect`, in the
 /// colour of its depth. Edges with an end behind the camera are left out.
 fn cube_ui(painter: &egui::Painter, view_proj: Mat4, rect: egui::Rect, node: &Node) {
@@ -717,7 +731,9 @@ impl ViewSettings {
         ui.ctx().request_repaint();
     }
 
-    fn controls_ui(&mut self, ui: &mut egui::Ui) {
+    /// Point size and colour mode. With "Octree depth", also a legend for depths
+    /// 0 to `deepest`.
+    fn controls_ui(&mut self, ui: &mut egui::Ui, deepest: u8) {
         ui.add(egui::Slider::new(&mut self.point_size, 1.0..=10.0).text("Point size (px)"));
 
         ui.separator();
@@ -732,6 +748,10 @@ impl ViewSettings {
         );
         ui.radio_value(&mut self.color_mode, ColorMode::Intensity, "Intensity");
         ui.radio_value(&mut self.color_mode, ColorMode::OctreeDepth, "Octree depth");
+
+        if self.color_mode == ColorMode::OctreeDepth {
+            depth_legend_ui(ui, deepest);
+        }
     }
 
     /// Continuous repaint, the max octree depth slider (0 to `deepest`) and the
@@ -1065,7 +1085,7 @@ impl eframe::App for Brume {
 
                             ui.separator();
 
-                            self.view.controls_ui(ui);
+                            self.view.controls_ui(ui, scene.deepest());
 
                             ui.separator();
 

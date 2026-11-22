@@ -10,8 +10,15 @@ struct Camera {
 @group(0) @binding(0)
 var<uniform> camera: Camera;
 
+// Colour tables, uploaded once: one per class code, then one per octree depth
+// (deeper levels cycle). `depths` has DEPTH_PALETTE_LEN entries (report.rs).
+struct Palettes {
+    classes: array<vec4<f32>, 256>,
+    depths: array<vec4<f32>, 8>,
+};
+
 @group(0) @binding(1)
-var<uniform> class_palette: array<vec4<f32>, 256>;
+var<uniform> palettes: Palettes;
 
 struct VertexIn {
     @location(0) position: vec3<f32>,
@@ -31,9 +38,6 @@ var<private> CORNERS: array<vec2<f32>, 4> = array<vec2<f32>, 4>(
     vec2(-1.0,  1.0),
     vec2( 1.0,  1.0),
 );
-
-// Octree depth shown as the top of the viridis ramp; deeper nodes look the same.
-const DEEPEST_COLOURED_DEPTH: f32 = 15.0;
 
 // Polynomial fit of matplotlib's viridis colour map (by Matt Zucker, CC0).
 // t in 0..1: dark purple -> blue -> green -> yellow.
@@ -55,7 +59,7 @@ fn point_color(in: VertexIn) -> vec4<f32> {
     let depth = (in.attributes >> 8u) & 0xFFu;
     let intensity = in.attributes >> 16u;
 
-    // Normalise height, intensity and depth to 0..1.
+    // Normalise height and intensity to 0..1.
     let height_t = clamp(
         (in.position.z - camera.height_range.x) / (camera.height_range.y - camera.height_range.x),
         0.0, 1.0,
@@ -64,15 +68,14 @@ fn point_color(in: VertexIn) -> vec4<f32> {
         (f32(intensity) - camera.intensity_range.x) / (camera.intensity_range.y - camera.intensity_range.x),
         0.0, 1.0,
     );
-    let depth_t = clamp(f32(depth) / DEEPEST_COLOURED_DEPTH, 0.0, 1.0);
 
     // Pick the colour by mode (0 RGB, 1 height, 2 class, 3 intensity, 4 octree depth).
     var color = in.color;
     switch camera.color_mode {
         case 1u: { color = vec4(viridis(height_t), 1.0); }
-        case 2u: { color = class_palette[classification]; }
+        case 2u: { color = palettes.classes[classification]; }
         case 3u: { color = vec4(vec3(intensity_t), 1.0); }
-        case 4u: { color = vec4(viridis(depth_t), 1.0); }
+        case 4u: { color = palettes.depths[depth % 8u]; }
         default: {}
     }
     return color;

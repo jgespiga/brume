@@ -1,4 +1,5 @@
 use std::{
+    ops::Range,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -16,7 +17,8 @@ use glam::{Mat4, Vec2, Vec3};
 use crate::{
     camera::{FOV_Y, OrbitCamera, project_to_screen},
     loader::{LoadControl, is_lidar_file},
-    octree::{Node, OctreeStats},
+    lod::{LodParams, Selection, draw_ranges},
+    octree::{Node, Octree, OctreeParams, OctreeStats},
     perf::FrameTimes,
     render::{ColorMode, PointRenderer, PointsCallback},
     report::depth_color,
@@ -69,6 +71,25 @@ struct Scene {
     camera: OrbitCamera,
     /// Whether each tile is drawn, in the same order as `data.tiles`.
     visible: Vec<bool>,
+    /// The selection kept while "Freeze LOD" is on.
+    frozen: Option<FrozenLod>,
+}
+
+/// A level-of-detail selection kept while the camera moves, with the camera it was
+/// made for.
+struct FrozenLod {
+    selection: Selection,
+    view_proj: Mat4,
+}
+
+/// What the last frame's level-of-detail selection drew.
+#[derive(Clone, Copy, Default)]
+struct LodStats {
+    nodes: u32,
+    points: u64,
+    draw_calls: usize,
+    /// CPU time of the selection, or `None` when it was frozen.
+    select_time: Option<Duration>,
 }
 
 /// Files being read, one after another, by a "brume-loader" thread.
@@ -107,8 +128,15 @@ struct ViewSettings {
     /// it, so it is not recorded.
     skip_next_frame: bool,
     /// Deepest octree level drawn, or `None` for every level, however deep the
-    /// scene is.
+    /// scene is. A cap on the level-of-detail selection.
     max_depth: Option<u8>,
+    /// Most points drawn per frame, across all tiles.
+    point_budget: u64,
+    /// Nodes are refined while their sampling cells look bigger than this (px).
+    min_cell_px: f32,
+    /// Keep the last selection while the camera moves.
+    freeze_lod: bool,
+    lod_stats: LodStats,
     /// Whether to draw the wireframe box of each octree node over the points.
     show_nodes: bool,
     /// Node boxes drawn in the last frame, and whether [`MAX_NODE_BOXES`] cut them.
@@ -457,6 +485,7 @@ impl Scene {
             data,
             camera,
             visible,
+            frozen: None,
         }
     }
 
@@ -470,24 +499,81 @@ impl Scene {
         levels.max().unwrap_or(1).saturating_sub(1) as u8
     }
 
-    /// How many points to draw from each tile, in tile order: every level down to
-    /// `max_depth` (all of them for `None`), or 0 for hidden tiles.
-    fn draw_counts(&self, max_depth: Option<u8>) -> Vec<u32> {
-        self.data
+    /// Chooses the octree nodes to draw for a view of `view_proj`, `viewport_height_px`
+    /// physical pixels tall, with the level-of-detail settings of `view`.
+    fn select_nodes(
+        &self,
+        view_proj: Mat4,
+        viewport_height_px: f32,
+        view: &ViewSettings,
+    ) -> Selection {
+        let tiles: Vec<(&Octree, bool)> = self
+            .data
             .tiles
             .iter()
             .zip(&self.visible)
-            .map(|(tile, &visible)| {
-                let counts = &tile.points_up_to_depth;
-                let up_to_depth = max_depth
-                    .and_then(|depth| counts.get(usize::from(depth)))
-                    .or(counts.last());
-                if visible {
-                    up_to_depth.copied().unwrap_or(0)
-                } else {
-                    0
-                }
-            })
+            .map(|(tile, &visible)| (&tile.octree, visible))
+            .collect();
+        let params = LodParams {
+            point_budget: view.point_budget,
+            min_cell_px: view.min_cell_px,
+            max_depth: view.max_depth.unwrap_or(u8::MAX),
+        };
+
+        crate::lod::select(
+            &tiles,
+            view_proj,
+            self.camera.eye(),
+            viewport_height_px,
+            FOV_Y,
+            OctreeParams::default().grid,
+            &params,
+        )
+    }
+
+    /// This frame's selection: the frozen one while "Freeze LOD" is on (frozen
+    /// now if there is none yet), a fresh one otherwise. Records it in `view`.
+    fn frame_selection(
+        &mut self,
+        view_proj: Mat4,
+        viewport_height_px: f32,
+        view: &mut ViewSettings,
+    ) -> Selection {
+        if !view.freeze_lod {
+            self.frozen = None;
+        }
+
+        let (selection, select_time) = match &self.frozen {
+            Some(frozen) => (frozen.selection.clone(), None),
+            None => {
+                let started = Instant::now();
+                let selection = self.select_nodes(view_proj, viewport_height_px, view);
+                (selection, Some(started.elapsed()))
+            }
+        };
+        if view.freeze_lod && self.frozen.is_none() {
+            self.frozen = Some(FrozenLod {
+                selection: selection.clone(),
+                view_proj,
+            });
+        }
+
+        view.lod_stats = LodStats {
+            nodes: selection.nodes,
+            points: selection.points,
+            draw_calls: 0,
+            select_time,
+        };
+        selection
+    }
+
+    /// The merged point ranges of `selection`, per tile.
+    fn draw_ranges(&self, selection: &Selection) -> Vec<Vec<Range<u32>>> {
+        self.data
+            .tiles
+            .iter()
+            .zip(&selection.per_tile)
+            .map(|(tile, nodes)| draw_ranges(&tile.octree, nodes))
             .collect()
     }
 
@@ -600,6 +686,10 @@ impl Scene {
                 ];
                 view.viewport_px = Some(viewport);
 
+                let selection = self.frame_selection(view_proj, viewport[1], view);
+                let draw_ranges = self.draw_ranges(&selection);
+                view.lod_stats.draw_calls = draw_ranges.iter().map(Vec::len).sum();
+
                 ui.painter().add(egui_wgpu::Callback::new_paint_callback(
                     rect,
                     PointsCallback {
@@ -609,7 +699,7 @@ impl Scene {
                         color_mode: view.color_mode,
                         height_range: self.data.height_range,
                         intensity_range: self.data.intensity_range,
-                        draw_counts: self.draw_counts(view.max_depth),
+                        draw_ranges,
                     },
                 ));
 
@@ -707,6 +797,10 @@ impl ViewSettings {
             continuous_repaint: false,
             skip_next_frame: false,
             max_depth: None,
+            point_budget: 1_500_000,
+            min_cell_px: 1.0,
+            freeze_lod: false,
+            lod_stats: LodStats::default(),
             show_nodes: false,
             nodes_drawn: (0, false),
             gpu_info,
@@ -754,8 +848,8 @@ impl ViewSettings {
         }
     }
 
-    /// Continuous repaint, the max octree depth slider (0 to `deepest`) and the
-    /// node boxes checkbox.
+    /// Continuous repaint, the level-of-detail settings (max octree depth from 0 to
+    /// `deepest`, point budget, min cell size, freeze) and the node boxes checkbox.
     fn perf_controls_ui(&mut self, ui: &mut egui::Ui, deepest: u8) {
         let toggled = ui
             .checkbox(&mut self.continuous_repaint, "Continuous repaint")
@@ -773,17 +867,17 @@ impl ViewSettings {
             self.max_depth = (depth < deepest).then_some(depth);
         }
 
+        let mut budget = self.point_budget as f64;
+        let slider = egui::Slider::new(&mut budget, 1e5..=3e7)
+            .logarithmic(true)
+            .integer()
+            .text("Point budget");
+        if ui.add(slider).changed() {
+            self.point_budget = budget as u64;
+        }
+        ui.add(egui::Slider::new(&mut self.min_cell_px, 0.25..=4.0).text("Min cell size (px)"));
+        ui.checkbox(&mut self.freeze_lod, "Freeze LOD");
         ui.checkbox(&mut self.show_nodes, "Show octree nodes");
-    }
-
-    /// Returns how many points [`PointsCallback`] draws from the visible tiles of
-    /// `scene` at the current `max_depth`.
-    fn points_drawn(&self, scene: &Scene) -> u64 {
-        scene
-            .draw_counts(self.max_depth)
-            .into_iter()
-            .map(u64::from)
-            .sum()
     }
 
     fn perf_ui(&self, ui: &mut egui::Ui, scene: &Scene) {
@@ -800,7 +894,17 @@ impl ViewSettings {
         ));
         ui.label(format!("FPS: {}", format_or_dash(fps, 0, "")));
         ui.label(format!("Points: {}", scene.data.stats.points));
-        ui.label(format!("Points drawn: {}", self.points_drawn(scene)));
+        let lod = self.lod_stats;
+        ui.label(format!("Nodes selected: {}", lod.nodes));
+        ui.label(format!("Points drawn: {}", lod.points));
+        ui.label(format!("Draw calls: {}", lod.draw_calls));
+        ui.label(format!(
+            "Selection time: {}",
+            lod.select_time.map_or_else(
+                || "frozen".to_owned(),
+                |time| format!("{} µs", time.as_micros())
+            )
+        ));
         if self.show_nodes {
             let (boxes, capped) = self.nodes_drawn;
             let capped = if capped { " (capped)" } else { "" };

@@ -1,4 +1,4 @@
-use std::{num::NonZeroU64, sync::Arc};
+use std::{num::NonZeroU64, ops::Range, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use bytemuck::{Pod, Zeroable};
@@ -357,11 +357,10 @@ pub struct PointsCallback {
     pub color_mode: ColorMode,
     pub height_range: [f32; 2],
     pub intensity_range: [f32; 2],
-    /// How many points to draw from the start of each tile's buffers, in the
-    /// renderer's tile order: the points are in breadth-first octree order, so a
-    /// prefix is every level down to some depth. 0 for hidden tiles; tiles without
-    /// an entry are not drawn.
-    pub draw_counts: Vec<u32>,
+    /// The point ranges to draw from each tile's buffers, in the renderer's tile
+    /// order: one per selected octree node, with touching ranges merged. Each range
+    /// is one draw call; tiles without ranges are not drawn.
+    pub draw_ranges: Vec<Vec<Range<u32>>>,
 }
 
 impl egui_wgpu::CallbackTrait for PointsCallback {
@@ -400,16 +399,20 @@ impl egui_wgpu::CallbackTrait for PointsCallback {
 
         render_pass.set_pipeline(&renderer.pipeline);
         render_pass.set_bind_group(0, &renderer.bind_group, &[]);
-        // One draw call per drawn tile.
-        for (tile, &count) in renderer.tiles.iter().zip(&self.draw_counts) {
-            let instances = count.min(tile.len);
-            if instances == 0 {
+        // Each tile's buffers are bound once, then one draw call per range.
+        for (tile, ranges) in renderer.tiles.iter().zip(&self.draw_ranges) {
+            if ranges.is_empty() {
                 continue;
             }
             render_pass.set_vertex_buffer(0, tile.positions.slice(..));
             render_pass.set_vertex_buffer(1, tile.colors.slice(..));
             render_pass.set_vertex_buffer(2, tile.attributes.slice(..));
-            render_pass.draw(0..4, 0..instances);
+            for range in ranges {
+                let instances = range.start.min(tile.len)..range.end.min(tile.len);
+                if !instances.is_empty() {
+                    render_pass.draw(0..4, instances);
+                }
+            }
         }
     }
 }

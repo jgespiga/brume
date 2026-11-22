@@ -66,6 +66,38 @@ Shift while dropping.
 - **One coordinate system.** Tiles from different UTM zones would need
   reprojecting to a common zone, which Brume does not support.
 
+### Level of detail
+
+Each tile has an octree whose nodes each keep a grid-sampled subset of their
+points, coarse levels first. Every frame, Brume chooses which nodes to draw
+across all visible tiles, so the cost depends on the view and the budget, not
+on the size of the scene.
+
+- **Frustum culling.** The six planes of the camera's view volume are taken
+  from its view-projection matrix. A node whose box is entirely outside any
+  plane is skipped together with all its children; the test is conservative,
+  so it never drops a box that is on screen.
+- **Screen-size priority.** Nodes wait in one queue for all tiles, ordered by
+  how many pixels their cube covers at its distance from the camera. The
+  biggest on screen are taken first, so detail goes where it is most visible
+  and distant tiles stay coarse.
+- **Point budget.** Nodes are taken until the next one would go over the
+  budget (1.5 M points by default), so the number of points drawn per frame
+  stays bounded however many tiles are loaded.
+- **Min cell size.** A node's children are only considered while its sampling
+  grid cells (node size / 128) look bigger than this many pixels (1 by
+  default). Past that, extra points would land on pixels already covered, so
+  close-up views stop refining before the budget runs out.
+
+Selected nodes are drawn with one draw call per run of nodes that are
+contiguous in the tile's buffers. For the whole-block view with the default
+settings, one tile selects 51 nodes in 2 draw calls and three tiles 46 nodes
+in 3, and the selection takes about 9 µs of CPU per frame.
+
+| View | Budget | Points drawn | Nodes | Avg frame (ms) |
+| --- | --- | --- | --- | --- |
+| | | | | |
+
 ## Performance
 
 Tile `PNOA-2024-MAD-419-4463`: 7,533,341 points (7.5 pts/m²).

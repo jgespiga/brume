@@ -1,3 +1,40 @@
+//! Spatial sampling for a tile's level of detail.
+//!
+//! [`Octree::build`] divides a cube into a sampling grid. The first point in
+//! each cell stays in the current [`Node`]; later points go to child octants.
+//! Each point belongs to exactly one node. Drawing children adds detail to the
+//! parent sample, so [`crate::lod::select`] selects ancestors before descendants.
+//! The scheme follows the sampling of Potree's modifiable nested octree, MNO,
+//! described by Scheiblauer and Wimmer in 2011.
+//!
+//! The tree uses an arena, a vector whose indices replace pointers between
+//! nodes. Both nodes and their point ranges follow breadth-first order.
+//! This example omits empty octants:
+//!
+//! ```text
+//! Tree                  Arena
+//!       root            [root, A, B, C, D]
+//!       /  \
+//!      A    B
+//!     / \
+//!    C   D
+//!
+//! Reordered point columns
+//! | root |  A   |  B   |  C   |  D   |
+//! <------>                            depth 0
+//! <-------------------->              through depth 1
+//! <----------------------------------> all
+//! ```
+//!
+//! A node's range contains its own sample, not its descendants' points.
+//! [`Octree::build`] returns a permutation rather than moving point attributes.
+//! [`crate::cloud::PointChunk::permuted`] applies it to every column, keeping
+//! colours and other attributes aligned with positions. [`crate::lod::draw_ranges`]
+//! can then merge adjacent selected ranges into a single draw.
+//!
+//! Start with [`Octree::build`] for the sampling algorithm, then [`Node::cell_of`]
+//! for grid indexing and [`Octree::points_up_to_depth`] for prefix counts.
+
 use std::collections::VecDeque;
 
 use glam::Vec3;
@@ -5,24 +42,27 @@ use glam::Vec3;
 /// Marks a missing child in [`Node::children`].
 pub const NO_CHILD: u32 = u32::MAX;
 
-/// Added to the root cube's edge so points on the far faces of the bounds still
-/// fall strictly inside the grid (metres). Also gives a cloud of one point, or of
-/// identical points, a cube with a non-zero edge.
+/// Padding in metres for the enclosing cube. It gives coincident points a
+/// nonzero edge and makes room for points on the far faces when precision allows.
+/// [`Node::cell_of`] also clamps cell indices because rounding can reach an edge.
 const ROOT_PADDING: f32 = 1e-3;
 
 /// How an [`Octree`] samples and splits its points.
 #[derive(Clone, Copy, Debug)]
 pub struct OctreeParams {
-    /// Cells per edge of the sampling grid of each node: an inner node keeps at most
-    /// one point per cell, so at most `grid³` points.
+    /// Cells per edge of each node's sampling grid. An inner node keeps at most
+    /// `grid^3` points. [`Octree::build`] treats zero as one cell per edge.
     pub grid: u32,
     /// A node with at most this many points keeps all of them and has no children.
     pub max_leaf_points: u32,
-    /// Nodes at this depth keep all their points, however many there are.
+    /// Nodes at this depth keep all remaining points. This stops repeated splits
+    /// when coincident points keep falling into the same cell.
     pub max_depth: u8,
 }
 
 impl Default for OctreeParams {
+    /// Uses 128 cells per edge and a depth limit of 16. A node that receives at
+    /// most 50,000 points keeps them all and becomes a leaf.
     fn default() -> Self {
         Self {
             grid: 128,
@@ -32,24 +72,31 @@ impl Default for OctreeParams {
     }
 }
 
-/// One cube of an [`Octree`].
+/// A cube and its own point range in an [`Octree`].
+///
+/// [`Node::children`] indexes [`Octree::nodes`], while [`Node::first_point`]
+/// indexes the reordered columns in [`crate::cloud::Tile::points`]. These are
+/// separate index spaces. A child owns points that its parent did not keep.
 #[derive(Clone, Debug)]
 pub struct Node {
-    /// Corner of the cube with the smallest coordinates.
+    /// Corner with the smallest coordinates, relative to the scene origin.
     pub bounds_min: Vec3,
-    /// Edge of the cube.
+    /// Edge length in metres, shared by all axes so each split makes equal cubes.
     pub size: f32,
-    /// 0 for the root.
+    /// Levels below the root; the root has depth 0.
     pub depth: u8,
-    /// Arena index of the child in each octant, or [`NO_CHILD`]. Octant bits: 1 = upper
-    /// half in x, 2 = in y, 4 = in z.
+    /// Arena index of each child, or [`NO_CHILD`] for an empty octant.
+    /// [`Node::octant_of`] defines the octant bit layout.
     pub children: [u32; 8],
-    /// Index of this node's first point in the reordered points.
+    /// Start of this node's sample in the reordered columns, not the input order.
     pub first_point: u32,
+    /// Length of this node's sample, excluding points in descendants.
     pub point_count: u32,
 }
 
 impl Node {
+    /// Creates an empty cube. The builder fills its range and child indices
+    /// after deciding which points remain in it.
     fn new(bounds_min: Vec3, size: f32, depth: u8) -> Self {
         Self {
             bounds_min,
@@ -61,16 +108,28 @@ impl Node {
         }
     }
 
+    /// Whether the node has no children. Sampling can also produce a leaf when
+    /// every point occupies a different cell and none remain for child octants.
     pub fn is_leaf(&self) -> bool {
         self.children.iter().all(|&child| child == NO_CHILD)
     }
 
-    /// The centre of the cube.
+    /// The split position shared by all child octants.
     pub fn centre(&self) -> Vec3 {
         self.bounds_min + Vec3::splat(self.size * 0.5)
     }
 
-    /// The octant of the cube that `point` falls in, as an index into `children`.
+    /// The child octant containing `point`, as an index into [`Node::children`].
+    /// Points on a split plane go to the upper half of that axis.
+    ///
+    /// ```text
+    /// Octant index bits
+    /// +-------+-------+-------+
+    /// | bit 2 | bit 1 | bit 0 |
+    /// |   z   |   y   |   x   |
+    /// +-------+-------+-------+
+    /// 0 = below centre, 1 = at or above centre
+    /// ```
     pub fn octant_of(&self, point: Vec3) -> usize {
         let centre = self.centre();
         usize::from(point.x >= centre.x)
@@ -78,7 +137,8 @@ impl Node {
             | usize::from(point.z >= centre.z) << 2
     }
 
-    /// Corner and edge of the cube of `octant`.
+    /// The minimum corner and edge length for a child octant.
+    /// Uses the same axis bits as [`Node::octant_of`], with half the parent edge.
     pub fn octant_cube(&self, octant: usize) -> (Vec3, f32) {
         let half = self.size * 0.5;
         let centre = self.centre();
@@ -92,7 +152,14 @@ impl Node {
         (min, half)
     }
 
-    /// Index of the sampling grid cell that `point` falls in.
+    /// Returns the grid cell index containing `point`, with x varying fastest.
+    /// [`Occupancy`] uses this index to address the cell's bit.
+    /// `grid` must be nonzero. Clamping handles rounding at the cube faces.
+    ///
+    /// ```text
+    /// local position / cube size * grid -> [x, y, z] cell coordinates
+    /// cell index = (z * grid + y) * grid + x
+    /// ```
     fn cell_of(&self, point: Vec3, grid: u32) -> usize {
         let cells = grid as f32;
         let last = grid - 1;
@@ -104,44 +171,55 @@ impl Node {
     }
 }
 
-/// A level-of-detail octree over one tile's points, stored as an arena with the
-/// root at index 0 and nodes in breadth-first order.
+/// A tile's spatial hierarchy, with a coarse sample in each inner [`Node`].
 ///
-/// Each inner node keeps a grid-sampled subset of its points (a coarse version of
-/// its cube) and passes the rest down; drawing a node and its ancestors gives every
-/// point in its cube at that level of detail.
+/// The tree stores ranges, not point data. [`crate::cloud::Tile`] owns both the
+/// tree and the reordered columns those ranges address. Drawing every node
+/// draws every input point once; drawing only the root gives the coarsest sample.
 #[derive(Clone, Debug)]
 pub struct Octree {
+    /// Arena in breadth-first order, with the root at index zero.
+    /// Even an empty input produces one root with an empty point range.
     pub nodes: Vec<Node>,
 }
 
 /// Summary of an [`Octree`]'s shape.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OctreeStats {
+    /// Total number of nodes, including the root and leaves.
     pub nodes: usize,
+    /// Nodes without children, as tested by [`Node::is_leaf`].
     pub leaves: usize,
+    /// Deepest occupied node level, or zero for an empty root.
     pub max_depth: u8,
-    /// Points kept by the nodes of each depth, from the root (depth 0) down.
+    /// Points owned at each depth, starting at zero. These are per-level counts;
+    /// [`Octree::points_up_to_depth`] sums them into prefix counts.
     pub points_per_level: Vec<u64>,
 }
 
-/// Fixed-size bitset over the cells of a sampling grid.
+/// One bit per grid cell, reused across nodes to avoid a fresh allocation for
+/// each sample. Only occupancy matters; the first point goes straight into the
+/// output permutation, so the bitset need not store point indices.
 struct Occupancy {
+    /// Packed cells, with the last word padded to a multiple of 64 bits.
     words: Vec<u64>,
 }
 
 impl Occupancy {
+    /// Allocates enough zeroed words to address every cell.
     fn new(cells: usize) -> Self {
         Self {
             words: vec![0; cells.div_ceil(64)],
         }
     }
 
+    /// Forgets the previous node's sample while retaining the allocation.
     fn clear(&mut self) {
         self.words.fill(0);
     }
 
-    /// Marks `cell` as occupied. Returns whether it was empty.
+    /// Claims a cell and returns whether this is its first point.
+    /// The caller must pass a cell within the allocated grid.
     fn insert(&mut self, cell: usize) -> bool {
         let (word, bit) = (cell / 64, 1u64 << (cell % 64));
         let was_empty = self.words[word] & bit == 0;
@@ -151,14 +229,34 @@ impl Occupancy {
 }
 
 impl Octree {
-    /// Builds the octree of `positions`.
+    /// Builds a hierarchy from positions relative to the scene origin.
     ///
-    /// Returns the tree and the order of the points: `order[i]` is the index in
-    /// `positions` of the i-th reordered point. In that order each node's points are
-    /// contiguous and nodes come breadth first, so coarse levels come first.
+    /// Returns the tree and a permutation. `order[i]` indexes the input position
+    /// for output point `i`. Apply [`permute`] to each attribute column with the
+    /// same order. Each node then owns one contiguous range, and coarse levels
+    /// precede fine levels.
     ///
-    /// `cancelled` is called before each node; when it returns `true`, the build
-    /// stops and returns `None`.
+    /// A small node or a node at [`OctreeParams::max_depth`] keeps all its points.
+    /// Otherwise, the first point in each grid cell stays; the rest go to child
+    /// octants. This chooses existing points without averaging their attributes.
+    ///
+    /// ```text
+    /// One node, viewed as a slice through its sampling grid
+    /// +-----------+-----------+
+    /// | a, b      | c         |   a, c, d -> this node's range
+    /// +-----------+-----------+
+    /// |           | d, e, f   |   b, e, f -> their child octants
+    /// +-----------+-----------+
+    /// Letters show arrival order; the first point in each cell stays.
+    /// ```
+    ///
+    /// Calls `cancelled` before processing each node and returns `None` if it
+    /// returns `true`. The initial bounds scan and work within a node do not
+    /// check cancellation. An empty input returns one empty root.
+    ///
+    /// Point and node indices use `u32`; callers must keep inputs within that
+    /// index space. The grid needs `grid^3` occupancy bits, so callers must also
+    /// choose a grid that fits in memory.
     pub fn build(
         positions: &[[f32; 3]],
         params: &OctreeParams,
@@ -171,9 +269,8 @@ impl Octree {
         let grid = params.grid.max(1);
         let mut occupancy = Occupancy::new((grid as usize).pow(3));
 
-        // Nodes waiting to be processed, with the indices of the points that reach
-        // them. Children are queued in index order, so processing the queue front
-        // to back visits nodes in arena (breadth-first) order.
+        // Appending children to both the arena and the queue keeps point ranges
+        // in arena order. A stack would instead put descendants before siblings.
         let mut queue = VecDeque::from([(0, (0..positions.len() as u32).collect::<Vec<u32>>())]);
 
         while let Some((index, points)) = queue.pop_front() {
@@ -192,8 +289,8 @@ impl Octree {
                 continue;
             }
 
-            // The first point in each grid cell stays here; later ones go down to
-            // the child octant they fall in.
+            // Occupancy belongs to this node's grid, even though all nodes reuse
+            // the same allocation. Child grids cover smaller cubes.
             occupancy.clear();
             let mut kept = 0;
             let mut octants: [Vec<u32>; 8] = Default::default();
@@ -223,9 +320,20 @@ impl Octree {
         Some((Self { nodes }, order))
     }
 
-    /// For each depth `d`, the number of points kept by nodes of depth `0..=d`.
-    /// Nodes are in breadth-first order, so those are the first points: drawing
-    /// that many draws every level down to `d`.
+    /// Prefix lengths containing all levels through each depth.
+    ///
+    /// Breadth-first point order makes the running sum of
+    /// [`OctreeStats::points_per_level`] a buffer cutoff.
+    /// [`crate::cloud::Tile::points_up_to_depth`] caches these values. The app
+    /// uses the length to set the range of its "Max octree depth" slider.
+    /// Rendering uses the ranges chosen by [`crate::lod::select`].
+    ///
+    /// ```text
+    /// | depth 0 | depth 1 | depth 2 |
+    /// <--------->                    cutoff[0]
+    /// <------------------->          cutoff[1]
+    /// <-----------------------------> cutoff[2]
+    /// ```
     pub fn points_up_to_depth(&self) -> Vec<u32> {
         self.stats()
             .points_per_level
@@ -237,7 +345,9 @@ impl Octree {
             .collect()
     }
 
-    /// Node and leaf counts, depth, and points per level.
+    /// Scans the arena to summarize its shape and point distribution.
+    /// Counts only each node's own points, so descendants do not duplicate
+    /// their parents' contributions.
     pub fn stats(&self) -> OctreeStats {
         let max_depth = self.nodes.iter().map(|node| node.depth).max().unwrap_or(0);
         let mut points_per_level = vec![0; usize::from(max_depth) + 1];
@@ -254,8 +364,9 @@ impl Octree {
     }
 }
 
-/// The cube that encloses `positions`: its corner is their minimum and its edge
-/// their largest extent, plus [`ROOT_PADDING`].
+/// Encloses the input in a cube anchored at the minimum coordinates.
+/// The longest axis sets its edge, with [`ROOT_PADDING`] added for boundary
+/// points and coincident inputs. Empty input uses a padded cube at zero.
 fn root_cube(positions: &[[f32; 3]]) -> (Vec3, f32) {
     let Some((min, max)) = positions
         .iter()
@@ -270,7 +381,9 @@ fn root_cube(positions: &[[f32; 3]]) -> (Vec3, f32) {
     (min, (max - min).max_element() + ROOT_PADDING)
 }
 
-/// Returns `values` in the order given by `order` (indices into `values`).
+/// Copies an attribute column into the order returned by [`Octree::build`].
+/// Applying the same permutation to every column preserves point attributes.
+/// Every index in `order` must address `values`, or indexing panics.
 pub fn permute<T: Copy>(values: &[T], order: &[u32]) -> Vec<T> {
     order.iter().map(|&index| values[index as usize]).collect()
 }
@@ -297,6 +410,7 @@ mod tests {
             .collect()
     }
 
+    /// Uses smaller grids and leaves so test clouds exercise several levels.
     fn small_params() -> OctreeParams {
         OctreeParams {
             grid: 8,
@@ -305,10 +419,12 @@ mod tests {
         }
     }
 
+    /// Builds without cancellation for tests of the tree's invariants.
     fn build(positions: &[[f32; 3]], params: &OctreeParams) -> (Octree, Vec<u32>) {
         Octree::build(positions, params, || false).expect("not cancelled")
     }
 
+    /// Resolves a node's output range back to input positions for geometry checks.
     fn node_points<'a>(
         node: &Node,
         positions: &'a [[f32; 3]],
@@ -332,7 +448,7 @@ mod tests {
         }
         assert!(seen.iter().all(|&seen| seen), "some point is missing");
 
-        // Nodes' ranges are contiguous, in arena (breadth-first) order.
+        // Adjacent arena entries must own adjacent ranges without gaps.
         let mut next = 0;
         for node in &tree.nodes {
             assert_eq!(node.first_point, next);

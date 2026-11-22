@@ -17,7 +17,7 @@ use glam::{Mat4, Vec2, Vec3};
 use crate::{
     camera::{FOV_Y, OrbitCamera, project_to_screen},
     loader::{LoadControl, is_lidar_file},
-    lod::{LodParams, Selection, draw_ranges},
+    lod::{LodParams, Selection, draw_ranges, frustum_corners},
     octree::{Node, Octree, OctreeParams, OctreeStats},
     perf::FrameTimes,
     render::{ColorMode, PointRenderer, PointsCallback},
@@ -137,7 +137,8 @@ struct ViewSettings {
     /// Keep the last selection while the camera moves.
     freeze_lod: bool,
     lod_stats: LodStats,
-    /// Whether to draw the wireframe box of each octree node over the points.
+    /// Whether to draw the wireframe box of each selected octree node over the points,
+    /// and the frozen frustum while "Freeze LOD" is on.
     show_nodes: bool,
     /// Node boxes drawn in the last frame, and whether [`MAX_NODE_BOXES`] cut them.
     nodes_drawn: (usize, bool),
@@ -705,8 +706,13 @@ impl Scene {
 
                 // Painted after the callback, so the boxes are on top of the points.
                 if view.show_nodes {
-                    view.nodes_drawn =
-                        self.node_boxes_ui(ui.painter(), view_proj, rect, view.max_depth);
+                    let painter = ui.painter();
+                    view.nodes_drawn = self.node_boxes_ui(painter, view_proj, rect, &selection);
+                    if let Some(frozen) = &self.frozen {
+                        let stroke = egui::Stroke::new(1.5, egui::Color32::WHITE);
+                        let corners = frustum_corners(frozen.view_proj);
+                        wireframe_ui(painter, view_proj, rect, corners, stroke);
+                    }
                 }
             }
         });
@@ -714,25 +720,27 @@ impl Scene {
         panel.response.rect
     }
 
-    /// Draws the wireframe cube of every node down to `max_depth` of every visible
-    /// tile, coloured by depth, over the 3D view in `rect`. Coarse levels go first,
-    /// so when [`MAX_NODE_BOXES`] is reached the finest ones are left out. Returns
-    /// the boxes drawn and whether the cap was reached.
+    /// Draws the wireframe cube of every node in `selection`, coloured by depth,
+    /// over the 3D view in `rect`. Coarse levels go first, so when
+    /// [`MAX_NODE_BOXES`] is reached the finest ones are left out. Returns the boxes
+    /// drawn and whether the cap was reached.
     fn node_boxes_ui(
         &self,
         painter: &egui::Painter,
         view_proj: Mat4,
         rect: egui::Rect,
-        max_depth: Option<u8>,
+        selection: &Selection,
     ) -> (usize, bool) {
         let mut nodes: Vec<&Node> = self
             .data
             .tiles
             .iter()
-            .zip(&self.visible)
-            .filter(|&(_, &visible)| visible)
-            .flat_map(|(tile, _)| &tile.octree.nodes)
-            .filter(|node| max_depth.is_none_or(|depth| node.depth <= depth))
+            .zip(&selection.per_tile)
+            .flat_map(|(tile, nodes)| {
+                nodes
+                    .iter()
+                    .filter_map(|&index| tile.octree.nodes.get(index as usize))
+            })
             .collect();
         // Stable, so each tile's nodes keep their breadth-first order within a level.
         nodes.sort_by_key(|node| node.depth);
@@ -761,23 +769,38 @@ fn depth_legend_ui(ui: &mut egui::Ui, deepest: u8) {
 }
 
 /// Draws the edges of `node`'s cube, projected with `view_proj` into `rect`, in the
-/// colour of its depth. Edges with an end behind the camera are left out.
+/// colour of its depth.
 fn cube_ui(painter: &egui::Painter, view_proj: Mat4, rect: egui::Rect, node: &Node) {
     let [r, g, b] = depth_color(node.depth);
     let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(r, g, b));
-    let (rect_min, rect_size) = (
-        Vec2::new(rect.min.x, rect.min.y),
-        Vec2::new(rect.width(), rect.height()),
-    );
-
-    let corners: [Option<egui::Pos2>; 8] = std::array::from_fn(|corner| {
+    let corners = std::array::from_fn(|corner| {
         let offset = Vec3::new(
             (corner & 1) as f32,
             ((corner >> 1) & 1) as f32,
             ((corner >> 2) & 1) as f32,
         );
-        let point = node.bounds_min + offset * node.size;
-        project_to_screen(view_proj, point, rect_min, rect_size)
+        node.bounds_min + offset * node.size
+    });
+
+    wireframe_ui(painter, view_proj, rect, corners, stroke);
+}
+
+/// Draws the 12 edges of a box-like shape given by its 8 `corners` (bits: 1 = +x,
+/// 2 = +y, 4 = +z, as for octants), projected with `view_proj` into `rect`. Edges
+/// with an end behind the camera are left out.
+fn wireframe_ui(
+    painter: &egui::Painter,
+    view_proj: Mat4,
+    rect: egui::Rect,
+    corners: [Vec3; 8],
+    stroke: egui::Stroke,
+) {
+    let (rect_min, rect_size) = (
+        Vec2::new(rect.min.x, rect.min.y),
+        Vec2::new(rect.width(), rect.height()),
+    );
+    let corners = corners.map(|corner| {
+        project_to_screen(view_proj, corner, rect_min, rect_size)
             .map(|screen| egui::pos2(screen.x, screen.y))
     });
 

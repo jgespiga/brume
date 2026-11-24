@@ -222,6 +222,11 @@ pub enum ColorMode {
     Intensity,
     /// Owning node's depth, using the cyclic palette from [`depth_color`].
     OctreeDepth,
+    /// The level of detail drawn at the point's location, from the visible node
+    /// tree ([`crate::vnt`]), in the same palette. Unlike [`ColorMode::OctreeDepth`],
+    /// a coarse point inside a refined region takes the refined region's colour,
+    /// which shows the levels adaptive point size uses.
+    LodLevel,
 }
 
 impl PointRenderer {

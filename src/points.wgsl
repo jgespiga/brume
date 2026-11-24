@@ -145,23 +145,29 @@ fn lod_level_at(p: vec3<f32>) -> u32 {
     return level;
 }
 
+// Whether this frame needs lod_level_at: adaptive size or the "LOD level" colour.
+// The walk costs up to MAX_LOD_LEVELS steps per vertex, so other modes skip it.
+fn needs_lod_level() -> bool {
+    return camera.size_mode == 1u || camera.color_mode == 5u;
+}
+
 // The square's edge in pixels. In adaptive mode, the points of a level `level`
 // node are about root_size * spacing_factor / 2^level metres apart; projected at
 // this point's view depth (clip.w), that spacing times size_scale covers the gap
 // to its neighbours.
-fn point_size_px(position: vec3<f32>, clip_w: f32) -> f32 {
+fn point_size_px(level: u32, clip_w: f32) -> f32 {
     if camera.size_mode == 0u {
         return camera.point_size;
     }
 
-    let level = lod_level_at(position);
     let spacing = tile.root_size * camera.spacing_factor / exp2(f32(level));
     let size_px = spacing * camera.size_scale * camera.projection_factor / clip_w;
     return clamp(size_px, camera.min_size_px, camera.max_size_px);
 }
 
-// The colour of a point in the current colour mode: every mode is here.
-fn point_color(in: VertexIn) -> vec4<f32> {
+// The colour of a point in the current colour mode: every mode is here. `level`
+// is the walked level of detail, used by the "LOD level" mode.
+fn point_color(in: VertexIn, level: u32) -> vec4<f32> {
     // Unpack the per-point attributes: class | depth << 8 | intensity << 16.
     let classification = in.attributes & 0xFFu;
     let depth = (in.attributes >> 8u) & 0xFFu;
@@ -179,13 +185,15 @@ fn point_color(in: VertexIn) -> vec4<f32> {
         0.0, 1.0,
     );
 
-    // Pick the colour by mode (0 RGB, 1 height, 2 class, 3 intensity, 4 octree depth).
+    // Pick the colour by mode (0 RGB, 1 height, 2 class, 3 intensity, 4 octree
+    // depth, 5 LOD level). Depth and level share the depth palette.
     var color = in.color;
     switch camera.color_mode {
         case 1u: { color = vec4(viridis(height_t), 1.0); }
         case 2u: { color = palettes.classes[classification]; }
         case 3u: { color = vec4(vec3(intensity_t), 1.0); }
         case 4u: { color = palettes.depths[depth % 8u]; }
+        case 5u: { color = palettes.depths[level % 8u]; }
         default: {}
     }
     return color;
@@ -198,13 +206,20 @@ fn point_color(in: VertexIn) -> vec4<f32> {
 @vertex
 fn vs_main(@builtin(vertex_index) corner_index: u32, in: VertexIn) -> VertexOut {
     var clip = camera.view_proj * vec4(in.position, 1.0);
-    let size_px = point_size_px(in.position, clip.w);
+
+    // Walked once, and only when needed, then shared by size and colour.
+    var level = 0u;
+    if needs_lod_level() {
+        level = lod_level_at(in.position);
+    }
+
+    let size_px = point_size_px(level, clip.w);
     let offset = CORNERS[corner_index] * size_px / camera.viewport;
     clip = vec4(clip.xy + offset * clip.w, clip.z, clip.w);
 
     var out: VertexOut;
     out.clip = clip;
-    out.color = point_color(in);
+    out.color = point_color(in, level);
     return out;
 }
 

@@ -821,15 +821,15 @@ impl Scene {
 }
 
 /// One row per octree depth from 0 to `deepest`: a square in the depth's colour
-/// and "Depth N".
-fn depth_legend_ui(ui: &mut egui::Ui, deepest: u8) {
+/// and "`label` N". Octree depths and LOD levels share the palette.
+fn depth_legend_ui(ui: &mut egui::Ui, deepest: u8, label: &str) {
     for depth in 0..=deepest {
         ui.horizontal(|ui| {
             let [r, g, b] = depth_color(depth);
             let (square, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
             ui.painter()
                 .rect_filled(square, 2.0, egui::Color32::from_rgb(r, g, b));
-            ui.label(format!("Depth {depth}"));
+            ui.label(format!("{label} {depth}"));
         });
     }
 }
@@ -923,7 +923,7 @@ impl ViewSettings {
     }
 
     /// Point size (fixed, or adaptive with its scale and clamp) and colour mode.
-    /// With "Octree depth", also a legend for depths 0 to `deepest`.
+    /// With "Octree depth" or "LOD level", also a legend for depths 0 to `deepest`.
     fn controls_ui(&mut self, ui: &mut egui::Ui, deepest: u8) {
         ui.horizontal(|ui| {
             ui.label("Point size");
@@ -957,9 +957,12 @@ impl ViewSettings {
         );
         ui.radio_value(&mut self.color_mode, ColorMode::Intensity, "Intensity");
         ui.radio_value(&mut self.color_mode, ColorMode::OctreeDepth, "Octree depth");
+        ui.radio_value(&mut self.color_mode, ColorMode::LodLevel, "LOD level");
 
-        if self.color_mode == ColorMode::OctreeDepth {
-            depth_legend_ui(ui, deepest);
+        match self.color_mode {
+            ColorMode::OctreeDepth => depth_legend_ui(ui, deepest, "Depth"),
+            ColorMode::LodLevel => depth_legend_ui(ui, deepest, "Level"),
+            _ => {}
         }
     }
 

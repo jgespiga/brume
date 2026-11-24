@@ -45,7 +45,7 @@ use crate::{
     lod::{LodParams, Selection, draw_ranges, frustum_corners},
     octree::{Node, Octree, OctreeParams, OctreeStats},
     perf::FrameTimes,
-    render::{ColorMode, PointRenderer, PointSizeMode, PointSizing, PointsCallback},
+    render::{ColorMode, PixelRect, PointRenderer, PointSizeMode, PointSizing, PointsCallback},
     report::depth_color,
     scene::{LoadPlan, LoadedScene, load_scene},
     vnt::{self, VisibleNode},
@@ -742,11 +742,15 @@ impl Scene {
             if rect.width() > 0.0 && rect.height() > 0.0 {
                 let view_proj = self.camera.view_proj(rect.width() / rect.height());
 
+                // Rounded exactly as egui_wgpu rounds the callback's viewport, so
+                // the offscreen targets match it pixel for pixel.
                 let pixels_per_point = ui.ctx().pixels_per_point();
-                let viewport = [
-                    rect.width() * pixels_per_point,
-                    rect.height() * pixels_per_point,
-                ];
+                let pixels = PixelRect::from_points(
+                    [rect.min.x, rect.min.y],
+                    [rect.max.x, rect.max.y],
+                    pixels_per_point,
+                );
+                let viewport = pixels.size.map(|value| value as f32);
                 view.viewport_px = Some(viewport);
 
                 let selection = self.frame_selection(view_proj, viewport[1], view);
@@ -759,7 +763,8 @@ impl Scene {
                     rect,
                     PointsCallback {
                         view_proj,
-                        viewport,
+                        view: pixels,
+                        background: ui.visuals().panel_fill.to_normalized_gamma_f32(),
                         point_sizing: view.point_sizing,
                         projection_factor: viewport[1] / (2.0 * (FOV_Y * 0.5).tan()),
                         color_mode: view.color_mode,

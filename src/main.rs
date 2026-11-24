@@ -37,6 +37,7 @@ use crate::app::Brume;
 mod app;
 mod camera;
 mod cloud;
+mod edl;
 mod loader;
 mod lod;
 mod octree;
@@ -68,15 +69,13 @@ fn parse_args() -> Args {
     }
 }
 
-/// Starts eframe with the depth format required by [`render::PointRenderer`].
+/// Starts eframe with the wgpu backend. No depth buffer is requested: the points
+/// pass tests against its own (see [`edl`]), and egui's pass needs none.
 /// [`Brume::new`] rejects a context without the wgpu render state.
 fn main() -> Result<()> {
     let args = parse_args();
 
-    let mut options = eframe::NativeOptions {
-        depth_buffer: render::DEPTH_BITS,
-        ..Default::default()
-    };
+    let mut options = eframe::NativeOptions::default();
     if args.no_vsync {
         // `glow_options.vsync` only applies to the glow backend: wgpu reads the
         // surface's present mode instead.

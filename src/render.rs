@@ -18,9 +18,12 @@
 //! one tile's TileParams               -> group 1, uniform binding 1 (dynamic offset)
 //! ```
 //!
-//! [`egui_wgpu::CallbackTrait::paint`] binds a tile's columns once and draws each merged
-//! range as instances of a four-vertex triangle strip. The shader expands the
-//! point in screen space; depth testing keeps nearer squares in front.
+//! [`egui_wgpu::CallbackTrait::prepare`] draws the points into offscreen targets
+//! owned by [`crate::edl::EdlPass`], with egui's command encoder: it binds a tile's
+//! columns once and draws each merged range as instances of a four-vertex
+//! triangle strip. The shader expands the point in screen space; depth testing
+//! keeps nearer squares in front. [`egui_wgpu::CallbackTrait::paint`] then
+//! composites those targets into egui's frame.
 //!
 //! In adaptive size mode the shader also walks the tile's visible node tree
 //! ([`crate::vnt`]) to find the level of detail drawn at each point, and sizes
@@ -45,12 +48,10 @@ use eframe::wgpu::{BindGroup, Buffer};
 use glam::Mat4;
 
 use crate::cloud::{PointChunk, Tile};
+use crate::edl::{self, EdlPass};
 use crate::octree::{Octree, OctreeParams};
 use crate::report::{DEPTH_PALETTE_LEN, class_color, depth_color};
 use crate::vnt::VisibleNode;
-
-/// Bits of depth buffer requested from `eframe`. The pipeline must use the same format.
-pub const DEPTH_BITS: u8 = 24;
 
 /// Bytes per point of the largest per-point buffer, the positions (3 × f32).
 const MAX_BYTES_PER_POINT: u64 = std::mem::size_of::<[f32; 3]>() as u64;
@@ -72,6 +73,36 @@ pub struct PointRenderer {
     tile_layout: wgpu::BindGroupLayout,
     /// Visible node trees and per-tile parameters, sized for the current tiles.
     tile_bindings: TileBindings,
+    /// The offscreen targets the points are drawn into, and the pass that
+    /// composites them into egui's frame.
+    edl: EdlPass,
+}
+
+/// The view rectangle in physical pixels, rounded exactly as egui_wgpu rounds a
+/// paint callback's viewport (`ViewportInPixels::from_points` in epaint): each
+/// edge is rounded on its own, so the size is not the rounded size in points.
+///
+/// The offscreen targets are this size and the composite subtracts this origin,
+/// so both must match the viewport egui sets, pixel for pixel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PixelRect {
+    /// Top-left corner in the window, in physical pixels.
+    pub origin: [i32; 2],
+    pub size: [u32; 2],
+}
+
+impl PixelRect {
+    /// Converts a rectangle in egui points, `min` to `max`, at `pixels_per_point`.
+    pub fn from_points(min: [f32; 2], max: [f32; 2], pixels_per_point: f32) -> Self {
+        let round = |value: f32| (value * pixels_per_point).round() as i32;
+        let origin = [round(min[0]), round(min[1])];
+        let end = [round(max[0]), round(max[1])];
+
+        Self {
+            origin,
+            size: [0, 1].map(|axis| (end[axis] - origin[axis]).max(0) as u32),
+        }
+    }
 }
 
 /// Group 1: per-tile data for adaptive point size.
@@ -365,8 +396,6 @@ impl PointRenderer {
             ],
         });
 
-        let depth_format = egui_wgpu::depth_format_from_bits(DEPTH_BITS, 0);
-
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("points"),
             layout: Some(&pipeline_layout),
@@ -408,10 +437,15 @@ impl PointRenderer {
                 ],
             },
 
+            // Location 0 is the colour, location 1 the log2 view depth that the
+            // composite reads; both are offscreen targets (see crate::edl).
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: Some("fs_main"),
-                targets: &[Some(render_state.target_format.into())],
+                targets: &[
+                    Some(render_state.target_format.into()),
+                    Some(edl::LOG_DEPTH_FORMAT.into()),
+                ],
                 compilation_options: Default::default(),
             }),
 
@@ -419,8 +453,8 @@ impl PointRenderer {
                 topology: wgpu::PrimitiveTopology::TriangleStrip,
                 ..Default::default()
             },
-            depth_stencil: depth_format.map(|format| wgpu::DepthStencilState {
-                format,
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: edl::DEPTH_FORMAT,
                 depth_write_enabled: Some(true),
                 depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
@@ -436,6 +470,7 @@ impl PointRenderer {
             .map(|tile| upload_tile(device, tile))
             .collect::<Result<_>>()?;
         let tile_bindings = TileBindings::new(device, &tile_layout, &tiles);
+        let edl = EdlPass::new(device, render_state.target_format);
 
         // Hand everything to egui's renderer, where `paint` will find it. This drops
         // the previous scene's renderer and its buffers.
@@ -450,6 +485,7 @@ impl PointRenderer {
                 bind_group,
                 tile_layout,
                 tile_bindings,
+                edl,
             });
 
         Ok(())
@@ -619,8 +655,11 @@ fn pack_attributes(points: &PointChunk, octree: &Octree) -> Vec<u32> {
 pub struct PointsCallback {
     /// Current camera matrix, even when the LOD selection is frozen.
     pub view_proj: Mat4,
-    /// View rectangle size in physical pixels for screen-space point sizes.
-    pub viewport: [f32; 2],
+    /// The view rectangle in physical pixels: the size of the offscreen targets
+    /// and of the viewport the point sizes are computed for.
+    pub view: PixelRect,
+    /// Gamma-space RGBA of the panel, drawn where no point is.
+    pub background: [f32; 4],
     /// Fixed or adaptive point size and its settings.
     pub point_sizing: PointSizing,
     /// `viewport_height_px / (2 tan(fov_y / 2))`, for adaptive sizes.
@@ -641,21 +680,22 @@ pub struct PointsCallback {
 }
 
 impl egui_wgpu::CallbackTrait for PointsCallback {
-    /// Updates the camera uniform, the visible node trees and the per-tile
-    /// parameters before painting; no extra command buffers are needed because
-    /// the queue performs the writes.
+    /// Writes the camera uniform, the visible node trees and the per-tile
+    /// parameters, resizes the offscreen targets if the view changed size, and
+    /// records the points pass into them on egui's encoder, which egui submits
+    /// before its own render pass.
     fn prepare(
         &self,
-        _device: &wgpu::Device,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
         _screen_descriptor: &egui_wgpu::ScreenDescriptor,
-        _egui_encoder: &mut wgpu::CommandEncoder,
+        egui_encoder: &mut wgpu::CommandEncoder,
         resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
         let sizing = self.point_sizing;
         let uniform = CameraUniform {
             view_proj: self.view_proj.to_cols_array_2d(),
-            viewport: self.viewport,
+            viewport: self.view.size.map(|value| value as f32),
             point_size: sizing.fixed_px,
             color_mode: self.color_mode as u32,
             height_range: self.height_range,
@@ -670,10 +710,16 @@ impl egui_wgpu::CallbackTrait for PointsCallback {
             _pad: 0.0,
         };
 
-        let Some(renderer) = resources.get::<PointRenderer>() else {
+        let Some(renderer) = resources.get_mut::<PointRenderer>() else {
             return Vec::new();
         };
+        renderer.edl.resize(device, self.view.size);
+        let renderer: &PointRenderer = renderer;
+
         queue.write_buffer(&renderer.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
+        renderer
+            .edl
+            .write_uniform(queue, self.view, self.background);
 
         // All tiles' trees go into one buffer; each tile's parameters record
         // where its tree starts.
@@ -703,39 +749,87 @@ impl egui_wgpu::CallbackTrait for PointsCallback {
         }
         queue.write_buffer(&bindings.params, 0, &params);
 
+        if let Some(offscreen) = renderer.edl.offscreen() {
+            let [r, g, b, a] = self.background.map(f64::from);
+            let mut pass = egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("points"),
+                color_attachments: &[
+                    // Cleared to the panel, so the composite shows it where no
+                    // point is drawn.
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &offscreen.color,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color { r, g, b, a }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                    // Cleared to 0, which means "no point here".
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &offscreen.log_depth,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                ],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &offscreen.depth,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        // Only this pass tests against it.
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            self.draw_points(renderer, &mut pass);
+        }
+
         Vec::new()
     }
 
-    /// Draws selected instances in egui's render pass. Each tile binds its columns
-    /// and its group 1 offset once, then each merged range produces one
-    /// four-vertex instanced draw.
+    /// Composites the offscreen targets drawn in
+    /// [`egui_wgpu::CallbackTrait::prepare`] into egui's render pass.
     fn paint(
         &self,
         _info: egui::PaintCallbackInfo,
         render_pass: &mut wgpu::RenderPass<'static>,
         resources: &egui_wgpu::CallbackResources,
     ) {
-        let Some(renderer) = resources.get::<PointRenderer>() else {
-            return;
-        };
+        if let Some(renderer) = resources.get::<PointRenderer>() {
+            renderer.edl.paint(render_pass);
+        }
+    }
+}
 
-        render_pass.set_pipeline(&renderer.pipeline);
-        render_pass.set_bind_group(0, &renderer.bind_group, &[]);
-        // Each tile's buffers are bound once, then one draw call per range.
+impl PointsCallback {
+    /// Records the selected instances into `pass`. Each tile binds its columns and
+    /// its group 1 offset once, then each merged range produces one four-vertex
+    /// instanced draw.
+    fn draw_points(&self, renderer: &PointRenderer, pass: &mut wgpu::RenderPass<'_>) {
+        pass.set_pipeline(&renderer.pipeline);
+        pass.set_bind_group(0, &renderer.bind_group, &[]);
         let bindings = &renderer.tile_bindings;
         for (index, (tile, ranges)) in renderer.tiles.iter().zip(&self.draw_ranges).enumerate() {
             if ranges.is_empty() {
                 continue;
             }
             let params_offset = index as u64 * bindings.stride;
-            render_pass.set_bind_group(1, &bindings.bind_group, &[params_offset as u32]);
-            render_pass.set_vertex_buffer(0, tile.positions.slice(..));
-            render_pass.set_vertex_buffer(1, tile.colors.slice(..));
-            render_pass.set_vertex_buffer(2, tile.attributes.slice(..));
+            pass.set_bind_group(1, &bindings.bind_group, &[params_offset as u32]);
+            pass.set_vertex_buffer(0, tile.positions.slice(..));
+            pass.set_vertex_buffer(1, tile.colors.slice(..));
+            pass.set_vertex_buffer(2, tile.attributes.slice(..));
             for range in ranges {
                 let instances = range.start.min(tile.len)..range.end.min(tile.len);
                 if !instances.is_empty() {
-                    render_pass.draw(0..4, instances);
+                    pass.draw(0..4, instances);
                 }
             }
         }
@@ -772,6 +866,21 @@ mod tests {
             attributes
                 .iter()
                 .all(|a| a & 0xFF == 6 && a >> 16 == 0xABCD)
+        );
+    }
+
+    #[test]
+    fn pixel_rects_round_each_edge_like_egui() {
+        // 100.3 to 200.6 points at 1.5 pixels per point: edges at 150.45 and
+        // 300.9 pixels round to 150 and 301, a width of 151, while the width in
+        // points (100.3 * 1.5 = 150.45) would round to 150.
+        let rect = PixelRect::from_points([100.3, 10.0], [200.6, 20.0], 1.5);
+
+        assert_eq!(rect.origin, [150, 15]);
+        assert_eq!(rect.size, [151, 15]);
+        assert_eq!(
+            PixelRect::from_points([5.0, 5.0], [5.0, 4.0], 2.0).size,
+            [0, 0]
         );
     }
 

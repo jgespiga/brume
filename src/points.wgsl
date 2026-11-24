@@ -90,6 +90,17 @@ struct VertexOut {
     // The corner's CORNERS value, interpolated across the square: -1..1 on each
     // axis, with the point's centre at (0, 0).
     @location(1) corner: vec2<f32>,
+    // The point's view depth, clip.w; the same at all four corners.
+    @location(2) view_depth: f32,
+};
+
+// The points pass renders into two offscreen targets (edl.rs): the colour, and
+// log2 of the view depth, where the cleared 0 means "no point". The near plane is
+// 1 m away, so a drawn point's log2 depth is at least 0; exactly 0 only for a point
+// on the near plane, which reads as empty.
+struct FragmentOut {
+    @location(0) color: vec4<f32>,
+    @location(1) log_depth: f32,
 };
 
 // The 4 corners of a square, in triangle-strip order.
@@ -226,6 +237,7 @@ fn vs_main(@builtin(vertex_index) corner_index: u32, in: VertexIn) -> VertexOut 
     out.clip = clip;
     out.color = point_color(in, level);
     out.corner = CORNERS[corner_index];
+    out.view_depth = clip.w;
     return out;
 }
 
@@ -234,9 +246,13 @@ fn vs_main(@builtin(vertex_index) corner_index: u32, in: VertexIn) -> VertexOut 
 // overlapping points read as discs instead of blocks. Discarding can cost some
 // early depth testing on the GPU, which is why it can be turned off.
 @fragment
-fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
+fn fs_main(in: VertexOut) -> FragmentOut {
     if camera.round_points != 0u && dot(in.corner, in.corner) > 1.0 {
         discard;
     }
-    return in.color;
+
+    var out: FragmentOut;
+    out.color = in.color;
+    out.log_depth = log2(in.view_depth);
+    return out;
 }

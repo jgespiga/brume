@@ -1,4 +1,4 @@
-# Brume
+# <img src="assets/brume.svg" alt="" height="48" align="top"> Brume
 
 [![CI](https://github.com/jgespiga/brume/actions/workflows/ci.yml/badge.svg)](https://github.com/jgespiga/brume/actions/workflows/ci.yml)
 

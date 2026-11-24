@@ -149,7 +149,8 @@ struct TileBuffers {
 /// 108..112   maximum size in pixels (adaptive mode)
 /// 112..116   projection factor: pixels per metre at view depth 1
 /// 116..120   spacing factor: 1 / octree grid
-/// 120..128   padding to a multiple of 16
+/// 120..124   round points flag: 1 discards fragments outside the inscribed circle
+/// 124..128   padding to a multiple of 16
 /// ```
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -178,7 +179,9 @@ struct CameraUniform {
     projection_factor: f32,
     /// `1 / grid`: a node of edge `s` samples points about `s / grid` apart.
     spacing_factor: f32,
-    _pad: [f32; 2],
+    /// 1 to draw points as circles, 0 for squares.
+    round_points: u32,
+    _pad: f32,
 }
 
 const _: () = assert!(std::mem::size_of::<CameraUniform>() == 128);
@@ -206,6 +209,9 @@ pub struct PointSizing {
     /// Clamp of adaptive sizes, in physical pixels.
     pub min_px: f32,
     pub max_px: f32,
+    /// Draw each point as the circle inscribed in its square. Overlapping
+    /// circles look smoother than overlapping squares when points are large.
+    pub round: bool,
 }
 
 /// How points are coloured. The discriminants are the `color_mode` values the
@@ -247,9 +253,10 @@ impl PointRenderer {
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("uniforms"),
             entries: &[
+                // Also read by the fragment shader, for the round points flag.
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -659,7 +666,8 @@ impl egui_wgpu::CallbackTrait for PointsCallback {
             max_size_px: sizing.max_px,
             projection_factor: self.projection_factor,
             spacing_factor: 1.0 / OctreeParams::default().grid.max(1) as f32,
-            _pad: [0.0; 2],
+            round_points: u32::from(sizing.round),
+            _pad: 0.0,
         };
 
         let Some(renderer) = resources.get::<PointRenderer>() else {

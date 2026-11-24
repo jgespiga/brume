@@ -888,6 +888,7 @@ impl ViewSettings {
                 scale: 1.5,
                 min_px: 1.0,
                 max_px: 16.0,
+                round: true,
             },
             color_mode: ColorMode::Rgb,
             frame_times: FrameTimes::new(FRAME_WINDOW),
@@ -944,6 +945,7 @@ impl ViewSettings {
                 sizing.max_px = sizing.max_px.max(sizing.min_px);
             }
         }
+        ui.checkbox(&mut sizing.round, "Round points");
 
         ui.separator();
 

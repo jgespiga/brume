@@ -23,7 +23,9 @@ struct Camera {
     projection_factor: f32,
     // 1 / octree grid: the sample spacing of a node, as a fraction of its edge.
     spacing_factor: f32,
-    _pad: vec2<f32>,
+    // 1 draws points as circles (fs_main discards the square's corners).
+    round_points: u32,
+    _pad: f32,
 };
 
 @group(0) @binding(0)
@@ -85,6 +87,9 @@ struct VertexIn {
 struct VertexOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) color: vec4<f32>,
+    // The corner's CORNERS value, interpolated across the square: -1..1 on each
+    // axis, with the point's centre at (0, 0).
+    @location(1) corner: vec2<f32>,
 };
 
 // The 4 corners of a square, in triangle-strip order.
@@ -220,11 +225,18 @@ fn vs_main(@builtin(vertex_index) corner_index: u32, in: VertexIn) -> VertexOut 
     var out: VertexOut;
     out.clip = clip;
     out.color = point_color(in, level);
+    out.corner = CORNERS[corner_index];
     return out;
 }
 
-// No lighting or circular mask; every covered fragment keeps the point colour.
+// No lighting; every kept fragment has the point colour. With round points, the
+// fragments outside the circle inscribed in the square are discarded, so
+// overlapping points read as discs instead of blocks. Discarding can cost some
+// early depth testing on the GPU, which is why it can be turned off.
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
+    if camera.round_points != 0u && dot(in.corner, in.corner) > 1.0 {
+        discard;
+    }
     return in.color;
 }

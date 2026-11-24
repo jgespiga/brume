@@ -260,6 +260,11 @@ size_px = clamp(r / 128 / 2^level × scale × pixels per metre at distance 1
 The *LOD level* colour mode shows the walked level, in the octree depth
 palette.
 
+Each point is drawn as the circle inscribed in its square, which the
+fragment shader cuts out by discarding the corners. Overlapping circles look
+smoother than overlapping squares once points grow to several pixels; the
+*Round points* checkbox switches back to squares.
+
 ### [Camera and projection](src/camera.rs)
 
 The orbit camera uses Z as up, with yaw, pitch and distance around a target.

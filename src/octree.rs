@@ -131,10 +131,7 @@ impl Node {
     /// 0 = below centre, 1 = at or above centre
     /// ```
     pub fn octant_of(&self, point: Vec3) -> usize {
-        let centre = self.centre();
-        usize::from(point.x >= centre.x)
-            | usize::from(point.y >= centre.y) << 1
-            | usize::from(point.z >= centre.z) << 2
+        octant_index(self.centre(), point)
     }
 
     /// The minimum corner and edge length for a child octant.
@@ -362,6 +359,19 @@ impl Octree {
             points_per_level,
         }
     }
+}
+
+/// The octant of a cube split at `centre` that contains `point`: bit 0 is set
+/// when `x >= centre.x`, bit 1 for y and bit 2 for z. Points on a split plane go
+/// to the upper half of that axis.
+///
+/// This is the single definition of the octant order. [`Node::children`] is
+/// indexed by it, and [`crate::vnt`] walks its visible node trees with it, as does
+/// the shader's `lod_level_at` in points.wgsl.
+pub fn octant_index(centre: Vec3, point: Vec3) -> usize {
+    usize::from(point.x >= centre.x)
+        | usize::from(point.y >= centre.y) << 1
+        | usize::from(point.z >= centre.z) << 2
 }
 
 /// Encloses the input in a cube anchored at the minimum coordinates.

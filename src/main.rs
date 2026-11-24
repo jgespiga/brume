@@ -44,6 +44,7 @@ mod perf;
 mod render;
 mod report;
 mod scene;
+mod vnt;
 
 /// Command-line arguments: `brume [--no-vsync] [tile.laz...]`, flag in any position.
 struct Args {

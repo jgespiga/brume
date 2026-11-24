@@ -82,7 +82,19 @@ impl OrbitCamera {
     ///
     /// The box is wrapped in a sphere (radius = half the diagonal), and the zoom
     /// limits scale with that radius.
+    ///
+    /// Bounds that are not finite, or with a minimum above the maximum, frame the
+    /// origin instead: a scene of empty tiles has the infinite bounds of
+    /// [`crate::cloud::Stats::empty`].
     pub fn fit(bounds_min: Vec3, bounds_max: Vec3, fov_y: f32) -> Self {
+        let valid =
+            bounds_min.is_finite() && bounds_max.is_finite() && bounds_min.cmple(bounds_max).all();
+        let (bounds_min, bounds_max) = if valid {
+            (bounds_min, bounds_max)
+        } else {
+            (Vec3::ZERO, Vec3::ZERO)
+        };
+
         let radius = (0.5 * (bounds_max - bounds_min).length()).max(MIN_FIT_RADIUS);
 
         Self {
@@ -187,6 +199,19 @@ mod tests {
             project_to_screen(view_proj, behind, Vec2::ZERO, Vec2::ONE),
             None
         );
+    }
+
+    #[test]
+    fn fit_of_empty_or_invalid_bounds_frames_the_origin() {
+        let empty = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+        let nan = (Vec3::splat(f32::NAN), Vec3::ONE);
+
+        for (min, max) in [empty, nan] {
+            let camera = OrbitCamera::fit(min, max, FOV_Y);
+            assert_eq!(camera.target, Vec3::ZERO);
+            assert_eq!(camera.distance, fit_distance(MIN_FIT_RADIUS, FOV_Y));
+            assert!(camera.eye().is_finite());
+        }
     }
 
     #[test]

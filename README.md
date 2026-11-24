@@ -10,6 +10,7 @@ The implementation demonstrates:
 - [A shared f64 origin with f32 point offsets](src/cloud.rs).
 - [An octree with grid sampling and breadth-first point storage](src/octree.rs).
 - [Per-frame level of detail with frustum culling and a point budget](src/lod.rs).
+- [Adaptive point size from a visible node tree walked on the GPU](src/vnt.rs).
 - [Instanced rendering on wgpu with packed attributes](src/render.rs) and
   [screen-space point squares in WGSL](src/points.wgsl).
 
@@ -224,6 +225,40 @@ in 3, and the selection takes about 9 µs of CPU per frame.
 | View | Budget | Points drawn | Nodes | Avg frame (ms) |
 | --- | --- | --- | --- | --- |
 | | | | | |
+
+### [Adaptive point size](src/vnt.rs)
+
+Points are drawn as squares on screen. With a fixed size, a coarse level
+leaves gaps between its points, and close up even the full data does: PNOA
+points are about 0.4 m apart. In adaptive mode, the default, each point
+covers the sample spacing of the level of detail drawn where it lies. A node
+of edge `s` keeps about one point every `s / 128` metres, so a point at
+level `l` of a root of edge `r` gets `r / 128 / 2^l` metres, projected to
+pixels at its distance and scaled by *Size scale*.
+
+The level is the deepest selected node whose cube contains the point, not the
+depth of the node the point belongs to. Every selected node keeps its own
+sample, so a root point lies among the finer samples of any selected
+descendants. Sized by its own depth, it would grow to the root's spacing and
+cover that detail. Sized by the level at its location, it matches its
+neighbours.
+
+Each frame, Brume turns every tile's selected nodes into a visible node tree:
+one entry per selected node, with a bit mask of its selected children and the
+index of the first one. The trees of all tiles go into one storage buffer,
+and the vertex shader walks the drawn tile's tree from the root, one octant
+per level.
+
+```text
+level at p:  root ──octant of p──> child ──octant of p──> ... until no
+                                                          selected child
+
+size_px = clamp(r / 128 / 2^level × scale × pixels per metre at distance 1
+                / view depth, min, max)
+```
+
+The *LOD level* colour mode shows the walked level, in the octree depth
+palette.
 
 ### [Camera and projection](src/camera.rs)
 

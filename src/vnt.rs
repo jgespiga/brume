@@ -42,6 +42,10 @@ use crate::octree::{NO_CHILD, Octree, octant_index};
 /// Most levels a walk descends. Matches `MAX_LOD_LEVELS` in points.wgsl and the
 /// default [`crate::octree::OctreeParams::max_depth`], so a walk can reach every
 /// level the default octree builds.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by the reference walk, which only tests run")
+)]
 pub const MAX_LOD_LEVELS: u8 = 16;
 
 /// One selected octree node, laid out for the GPU as two `u32`s. Matches
@@ -108,6 +112,13 @@ pub fn build(octree: &Octree, selected: &[u32]) -> Vec<VisibleNode> {
 /// from which each step derives the child cube exactly as the octree builder did.
 ///
 /// Returns 0 for an empty tree. The walk stops after [`MAX_LOD_LEVELS`] steps.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the reference the shader mirrors; only tests call it"
+    )
+)]
 pub fn lod_level_at(tree: &[VisibleNode], root_min: Vec3, root_size: f32, point: Vec3) -> u8 {
     let Some(mut node) = tree.first() else {
         return 0;

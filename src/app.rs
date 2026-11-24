@@ -45,9 +45,10 @@ use crate::{
     lod::{LodParams, Selection, draw_ranges, frustum_corners},
     octree::{Node, Octree, OctreeParams, OctreeStats},
     perf::FrameTimes,
-    render::{ColorMode, PointRenderer, PointsCallback},
+    render::{ColorMode, PointRenderer, PointSizeMode, PointSizing, PointsCallback},
     report::depth_color,
     scene::{LoadPlan, LoadedScene, load_scene},
+    vnt::{self, VisibleNode},
 };
 
 /// Number of recent frames the performance figures are computed over.
@@ -159,8 +160,8 @@ enum FileAction {
 /// View settings and measurements the user chose, independent of the loaded file,
 /// so they survive a reload.
 struct ViewSettings {
-    /// Screen-space square size passed to the shader.
-    point_size: f32,
+    /// Fixed or adaptive point size, passed to the shader.
+    point_sizing: PointSizing,
     /// Attribute-to-colour mapping chosen by the user.
     color_mode: ColorMode,
     /// Recent intervals between UI calls during continuous repaint.
@@ -616,6 +617,16 @@ impl Scene {
         selection
     }
 
+    /// The visible node tree of each tile for `selection`, in tile order.
+    fn visible_nodes(&self, selection: &Selection) -> Vec<Vec<VisibleNode>> {
+        self.data
+            .tiles
+            .iter()
+            .zip(&selection.per_tile)
+            .map(|(tile, nodes)| vnt::build(&tile.octree, nodes))
+            .collect()
+    }
+
     /// The merged point ranges of `selection`, per tile.
     fn draw_ranges(&self, selection: &Selection) -> Vec<Vec<Range<u32>>> {
         self.data
@@ -741,17 +752,21 @@ impl Scene {
                 let selection = self.frame_selection(view_proj, viewport[1], view);
                 let draw_ranges = self.draw_ranges(&selection);
                 view.lod_stats.draw_calls = draw_ranges.iter().map(Vec::len).sum();
+                // Built from the same selection, so point sizes follow what is drawn.
+                let visible_nodes = self.visible_nodes(&selection);
 
                 ui.painter().add(egui_wgpu::Callback::new_paint_callback(
                     rect,
                     PointsCallback {
                         view_proj,
                         viewport,
-                        point_size: view.point_size,
+                        point_sizing: view.point_sizing,
+                        projection_factor: viewport[1] / (2.0 * (FOV_Y * 0.5).tan()),
                         color_mode: view.color_mode,
                         height_range: self.data.height_range,
                         intensity_range: self.data.intensity_range,
                         draw_ranges,
+                        visible_nodes,
                     },
                 ));
 
@@ -867,7 +882,13 @@ impl ViewSettings {
     /// user enables continuous repaint.
     fn new(gpu_info: String) -> Self {
         Self {
-            point_size: 2.0,
+            point_sizing: PointSizing {
+                mode: PointSizeMode::Adaptive,
+                fixed_px: 2.0,
+                scale: 1.5,
+                min_px: 1.0,
+                max_px: 16.0,
+            },
             color_mode: ColorMode::Rgb,
             frame_times: FrameTimes::new(FRAME_WINDOW),
             continuous_repaint: false,
@@ -901,10 +922,28 @@ impl ViewSettings {
         ui.ctx().request_repaint();
     }
 
-    /// Point size and colour mode. With "Octree depth", also a legend for depths
-    /// 0 to `deepest`.
+    /// Point size (fixed, or adaptive with its scale and clamp) and colour mode.
+    /// With "Octree depth", also a legend for depths 0 to `deepest`.
     fn controls_ui(&mut self, ui: &mut egui::Ui, deepest: u8) {
-        ui.add(egui::Slider::new(&mut self.point_size, 1.0..=10.0).text("Point size (px)"));
+        ui.horizontal(|ui| {
+            ui.label("Point size");
+            let mode = &mut self.point_sizing.mode;
+            ui.radio_value(mode, PointSizeMode::Fixed, "Fixed");
+            ui.radio_value(mode, PointSizeMode::Adaptive, "Adaptive");
+        });
+        let sizing = &mut self.point_sizing;
+        match sizing.mode {
+            PointSizeMode::Fixed => {
+                ui.add(egui::Slider::new(&mut sizing.fixed_px, 1.0..=10.0).text("Point size (px)"));
+            }
+            PointSizeMode::Adaptive => {
+                ui.add(egui::Slider::new(&mut sizing.scale, 0.5..=3.0).text("Size scale"));
+                ui.add(egui::Slider::new(&mut sizing.min_px, 1.0..=4.0).text("Min size (px)"));
+                ui.add(egui::Slider::new(&mut sizing.max_px, 2.0..=32.0).text("Max size (px)"));
+                // Keep the clamp range valid whichever slider moved last.
+                sizing.max_px = sizing.max_px.max(sizing.min_px);
+            }
+        }
 
         ui.separator();
 

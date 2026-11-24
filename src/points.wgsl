@@ -1,9 +1,12 @@
 // Each instance is one point from a tile's octree-ordered buffers. Four vertex
-// invocations expand its projected centre into a square of fixed pixel size.
+// invocations expand its projected centre into a square: a fixed number of
+// pixels, or, in adaptive mode, the projected sample spacing of the level of
+// detail drawn at the point (see lod_level_at).
 // Rust uploads matching layouts in render.rs; changes to bindings, field order
 // or colour mode values must agree on both sides.
 
 // Matches CameraUniform in render.rs, including column-major matrix storage.
+// 128 bytes; the offsets are listed there.
 struct Camera {
     view_proj: mat4x4<f32>,
     viewport: vec2<f32>,
@@ -11,6 +14,16 @@ struct Camera {
     color_mode: u32,
     height_range: vec2<f32>,
     intensity_range: vec2<f32>,
+    // 0 fixed (point_size), 1 adaptive (the fields below).
+    size_mode: u32,
+    size_scale: f32,
+    min_size_px: f32,
+    max_size_px: f32,
+    // Pixels covered by one metre at view depth 1.
+    projection_factor: f32,
+    // 1 / octree grid: the sample spacing of a node, as a fraction of its edge.
+    spacing_factor: f32,
+    _pad: vec2<f32>,
 };
 
 @group(0) @binding(0)
@@ -25,6 +38,33 @@ struct Palettes {
 
 @group(0) @binding(1)
 var<uniform> palettes: Palettes;
+
+// One selected octree node of a visible node tree (vnt.rs). child_mask has bit k
+// set when the child in octant k is selected; the selected children are stored
+// from first_child on, in octant order.
+struct VisibleNode {
+    child_mask: u32,
+    first_child: u32,
+};
+
+// The drawn tile, selected with a dynamic offset. Matches TileParams in render.rs;
+// WGSL rounds the struct up to 32 bytes because root_min, a vec3, aligns to 16.
+struct TileParams {
+    root_min: vec3<f32>,
+    root_size: f32,
+    // Index of this tile's root in visible_nodes. first_child is relative to it.
+    vnt_offset: u32,
+};
+
+// The visible node trees of all tiles, rewritten every frame.
+@group(1) @binding(0)
+var<storage, read> visible_nodes: array<VisibleNode>;
+
+@group(1) @binding(1)
+var<uniform> tile: TileParams;
+
+// Most levels lod_level_at descends; matches MAX_LOD_LEVELS in vnt.rs.
+const MAX_LOD_LEVELS: u32 = 16u;
 
 // Buffers advance per instance, so all four corners read the same attributes.
 // Positions are f32x3; Unorm8x4 converts colour bytes to floats before this stage.
@@ -74,6 +114,52 @@ fn viridis(t: f32) -> vec3<f32> {
     return c0 + t * (c1 + t * (c2 + t * (c3 + t * (c4 + t * (c5 + t * c6)))));
 }
 
+// The level of detail drawn at p: the depth of the deepest selected node of the
+// tile whose cube contains p. Mirrors lod_level_at in vnt.rs, which has the tests.
+//
+// Each step splits the current cube at its centre, picks the octant containing p
+// (bit 0 = x, 1 = y, 2 = z, set when at or above the centre, as octant_index in
+// octree.rs), and descends if that octant's child is selected. The child sits at
+// first_child plus the number of selected octants below it.
+fn lod_level_at(p: vec3<f32>) -> u32 {
+    var node = visible_nodes[tile.vnt_offset];
+    var cube_min = tile.root_min;
+    var size = tile.root_size;
+    var level = 0u;
+
+    for (var step = 0u; step < MAX_LOD_LEVELS; step++) {
+        let half = size * 0.5;
+        let centre = cube_min + vec3(half);
+        let upper = p >= centre;
+        let octant = select(0u, 1u, upper.x) | select(0u, 2u, upper.y) | select(0u, 4u, upper.z);
+        let bit = 1u << octant;
+        if (node.child_mask & bit) == 0u {
+            break;
+        }
+
+        node = visible_nodes[tile.vnt_offset + node.first_child + countOneBits(node.child_mask & (bit - 1u))];
+        cube_min = select(cube_min, centre, upper);
+        size = half;
+        level++;
+    }
+    return level;
+}
+
+// The square's edge in pixels. In adaptive mode, the points of a level `level`
+// node are about root_size * spacing_factor / 2^level metres apart; projected at
+// this point's view depth (clip.w), that spacing times size_scale covers the gap
+// to its neighbours.
+fn point_size_px(position: vec3<f32>, clip_w: f32) -> f32 {
+    if camera.size_mode == 0u {
+        return camera.point_size;
+    }
+
+    let level = lod_level_at(position);
+    let spacing = tile.root_size * camera.spacing_factor / exp2(f32(level));
+    let size_px = spacing * camera.size_scale * camera.projection_factor / clip_w;
+    return clamp(size_px, camera.min_size_px, camera.max_size_px);
+}
+
 // The colour of a point in the current colour mode: every mode is here.
 fn point_color(in: VertexIn) -> vec4<f32> {
     // Unpack the per-point attributes: class | depth << 8 | intensity << 16.
@@ -107,12 +193,13 @@ fn point_color(in: VertexIn) -> vec4<f32> {
 
 // Multiply the normalized-device offset by clip.w so perspective division
 // cancels it again. The square keeps its pixel size as camera distance changes.
-// CORNERS spans two units, so point_size / viewport gives the required half edge
+// CORNERS spans two units, so size_px / viewport gives the required half edge
 // in normalized device coordinates, whose full viewport spans two units.
 @vertex
 fn vs_main(@builtin(vertex_index) corner_index: u32, in: VertexIn) -> VertexOut {
     var clip = camera.view_proj * vec4(in.position, 1.0);
-    let offset = CORNERS[corner_index] * camera.point_size / camera.viewport;
+    let size_px = point_size_px(in.position, clip.w);
+    let offset = CORNERS[corner_index] * size_px / camera.viewport;
     clip = vec4(clip.xy + offset * clip.w, clip.z, clip.w);
 
     var out: VertexOut;

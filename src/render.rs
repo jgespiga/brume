@@ -127,20 +127,6 @@ impl PointRenderer {
             source: wgpu::ShaderSource::Wgsl(include_str!("points.wgsl").into()),
         });
 
-        // Legacy layout declaration. The active pipeline declares its buffers below.
-        let vertex_layouts = [
-            Some(wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress, // 12
-                step_mode: wgpu::VertexStepMode::Instance,
-                attributes: &wgpu::vertex_attr_array![0 => Float32x3],
-            }),
-            Some(wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<[u8; 4]>() as wgpu::BufferAddress, // 4
-                step_mode: wgpu::VertexStepMode::Instance,
-                attributes: &wgpu::vertex_attr_array![1 => Unorm8x4],
-            }),
-        ];
-
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("uniforms"),
             entries: &[

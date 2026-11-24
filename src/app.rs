@@ -885,7 +885,7 @@ impl ViewSettings {
             point_sizing: PointSizing {
                 mode: PointSizeMode::Adaptive,
                 fixed_px: 2.0,
-                scale: 1.5,
+                scale: 1.2,
                 min_px: 1.0,
                 max_px: 16.0,
                 round: true,

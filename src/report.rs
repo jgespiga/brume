@@ -167,31 +167,75 @@ pub fn percentile_range(values: &mut [f32], low: f64, high: f64) -> [f32; 2] {
     })
 }
 
+/// Half the width, in the attribute's own units, given to a colour range whose
+/// endpoints are equal. See [`non_degenerate`].
+const FLAT_RANGE_HALF_WIDTH: f32 = 0.5;
+
+/// Returns `range` unchanged if `high > low`, or widened around `low` otherwise.
+///
+/// The shader normalises with `(value - low) / (high - low)`, so equal endpoints,
+/// which [`percentile_range`] returns when an attribute is constant, would divide
+/// by zero. Widening maps such a constant attribute to the middle of its ramp.
+fn non_degenerate([low, high]: [f32; 2]) -> [f32; 2] {
+    if high > low {
+        [low, high]
+    } else {
+        [low - FLAT_RANGE_HALF_WIDTH, low + FLAT_RANGE_HALF_WIDTH]
+    }
+}
+
 /// Returns the p1-p99 range of the heights of the points in `chunks`, which may
-/// come from several tiles.
+/// come from several tiles. The range is never empty; see [`non_degenerate`].
 pub fn height_range<'a>(chunks: impl IntoIterator<Item = &'a PointChunk>) -> [f32; 2] {
     let mut heights = chunks
         .into_iter()
         .flat_map(|chunk| chunk.positions.iter().map(|position| position[2]))
         .collect::<Vec<f32>>();
 
-    percentile_range(&mut heights, 0.01, 0.99)
+    non_degenerate(percentile_range(&mut heights, 0.01, 0.99))
 }
 
 /// Returns the p2-p98 range of the intensities of the points in `chunks`, which
-/// may come from several tiles.
+/// may come from several tiles. The range is never empty; see [`non_degenerate`].
 pub fn intensity_range<'a>(chunks: impl IntoIterator<Item = &'a PointChunk>) -> [f32; 2] {
     let mut intensities = chunks
         .into_iter()
         .flat_map(|chunk| chunk.intensity.iter().copied().map(f32::from))
         .collect::<Vec<f32>>();
 
-    percentile_range(&mut intensities, 0.02, 0.98)
+    non_degenerate(percentile_range(&mut intensities, 0.02, 0.98))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn chunk(heights: &[f32], intensity: &[u16]) -> PointChunk {
+        PointChunk {
+            positions: heights.iter().map(|&z| [0.0, 0.0, z]).collect(),
+            classes: vec![0; heights.len()],
+            colors: vec![[0; 4]; heights.len()],
+            intensity: intensity.to_vec(),
+        }
+    }
+
+    #[test]
+    fn constant_attributes_get_a_range_around_their_value() {
+        let points = chunk(&[12.0; 50], &[900; 50]);
+
+        assert_eq!(height_range([&points]), [11.5, 12.5]);
+        assert_eq!(intensity_range([&points]), [899.5, 900.5]);
+    }
+
+    #[test]
+    fn varied_attributes_keep_their_percentile_range() {
+        let heights: Vec<f32> = (0..=100).map(|i| i as f32).collect();
+        let intensity: Vec<u16> = (0..=100).collect();
+        let points = chunk(&heights, &intensity);
+
+        assert_eq!(height_range([&points]), [1.0, 99.0]);
+        assert_eq!(intensity_range([&points]), [2.0, 98.0]);
+    }
 
     #[test]
     fn depth_colors_are_distinct_and_cycle() {

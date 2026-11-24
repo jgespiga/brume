@@ -82,7 +82,8 @@ fn point_color(in: VertexIn) -> vec4<f32> {
     let intensity = in.attributes >> 16u;
 
     // Percentile endpoints come from the whole scene. Clamping maps outliers to
-    // endpoint colours. Equal endpoints leave a zero denominator here.
+    // endpoint colours. report.rs widens equal endpoints, so neither denominator
+    // is zero, even for a constant attribute.
     let height_t = clamp(
         (in.position.z - camera.height_range.x) / (camera.height_range.y - camera.height_range.x),
         0.0, 1.0,

@@ -134,7 +134,7 @@ the octree. Batching bounds the decoded buffer; converted points still
 accumulate in memory, and reordering needs another copy of the columns.
 
 The LAS spec asks for 16-bit colour, but many files store 0–255. Brume
-checks the first batch before converting to 8 bits. A channel above 255
+checks every point before converting to 8 bits. A channel above 255
 selects the 16-bit conversion for the whole file. Legacy point formats
 pack flags into the class byte; Brume masks them out and keeps the full
 byte for LAS 1.4 extended formats.

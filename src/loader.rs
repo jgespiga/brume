@@ -27,7 +27,6 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use glam::DVec3;
-use las::PointData;
 
 use crate::{
     cloud::{Bounds, ColorDepth, NO_COLOR, PointChunk, Stats, Tile},
@@ -64,19 +63,40 @@ pub(crate) fn is_lidar_file(path: &Path) -> bool {
         })
 }
 
-/// Infers RGB depth from the first batch. A channel above 255 selects 16-bit
-/// conversion for the whole file; otherwise the loader treats RGB as 8-bit data.
-fn detect_color_depth(batch: &PointData) -> ColorDepth {
-    match batch.rgb() {
+/// The colour depth of a file, from its largest RGB channel over every point.
+///
+/// `None` means the point format has no RGB. The LAS spec asks for 16-bit
+/// channels, but many files store 0-255 in them: any channel above 255 means
+/// the file uses the full 16-bit range, otherwise it is treated as 8-bit.
+fn color_depth(max_channel: Option<u16>) -> ColorDepth {
+    match max_channel {
         None => ColorDepth::None,
-        Some(rgb) => {
-            let max = rgb.map(|(r, g, b)| r.max(g).max(b)).max().unwrap_or(0);
-            if max > 255 {
-                ColorDepth::Bits16
-            } else {
-                ColorDepth::Bits8
-            }
-        }
+        Some(max) if max > 255 => ColorDepth::Bits16,
+        Some(_) => ColorDepth::Bits8,
+    }
+}
+
+/// Converts one RGB value stored at `depth` to the 8-bit RGBA the GPU reads:
+/// 16-bit channels keep their high byte, 8-bit ones are clamped to 255.
+fn to_rgba8([r, g, b]: [u16; 3], depth: ColorDepth) -> [u8; 4] {
+    match depth {
+        ColorDepth::Bits16 => [(r >> 8) as u8, (g >> 8) as u8, (b >> 8) as u8, 255],
+        _ => [r.min(255) as u8, g.min(255) as u8, b.min(255) as u8, 255],
+    }
+}
+
+/// Gives every chunk its 8-bit colours from `rgb`, the raw colours of all the
+/// chunks in order, converted at `depth`. Points without a raw colour (files
+/// whose format has no RGB) get [`NO_COLOR`].
+fn fill_colors(chunks: &mut [PointChunk], rgb: &[[u16; 3]], depth: ColorDepth) {
+    let mut rgb = rgb.iter();
+    for chunk in chunks {
+        chunk.colors = rgb
+            .by_ref()
+            .take(chunk.len())
+            .map(|&color| to_rgba8(color, depth))
+            .collect();
+        chunk.colors.resize(chunk.len(), NO_COLOR);
     }
 }
 
@@ -127,8 +147,14 @@ pub(crate) fn load(path: &Path, origin: DVec3, control: &LoadControl) -> Result<
     let mut chunks = Vec::with_capacity(n_batches);
     let mut stats = Stats::empty();
 
+    // RGB stays 16-bit until every batch is read: only then is the file's colour
+    // depth known, so a high channel late in the file can't be clamped by a
+    // decision made on the first batch. Costs 6 bytes per point until converted.
+    let has_color = reader.header().point_format().has_color;
+    let mut rgb: Vec<[u16; 3]> = Vec::with_capacity(if has_color { n_points as usize } else { 0 });
+    let mut max_channel: Option<u16> = None;
+
     let mut batch = reader.read_points(BATCH_SIZE)?;
-    stats.color_depth = detect_color_depth(&batch);
 
     while !batch.is_empty() {
         let mut chunk = PointChunk {
@@ -159,28 +185,14 @@ pub(crate) fn load(path: &Path, origin: DVec3, control: &LoadControl) -> Result<
             chunk.intensity.push(intensity);
         }
 
-        match (batch.rgb(), stats.color_depth) {
-            (Some(rgb), ColorDepth::Bits16) => {
-                for (r, g, b) in rgb {
-                    chunk
-                        .colors
-                        .push([(r >> 8) as u8, (g >> 8) as u8, (b >> 8) as u8, 255]);
-                }
+        if let Some(colors) = batch.rgb() {
+            for (r, g, b) in colors {
+                max_channel = Some(max_channel.unwrap_or(0).max(r).max(g).max(b));
+                rgb.push([r, g, b]);
             }
-
-            (Some(rgb), _) => {
-                for (r, g, b) in rgb {
-                    chunk
-                        .colors
-                        .push([r.min(255) as u8, g.min(255) as u8, b.min(255) as u8, 255]);
-                }
-            }
-
-            (None, _) => chunk.colors.resize(batch.len(), NO_COLOR),
         }
 
         debug_assert_eq!(chunk.classes.len(), chunk.len());
-        debug_assert_eq!(chunk.colors.len(), chunk.len());
         debug_assert_eq!(chunk.intensity.len(), chunk.len());
 
         chunks.push(chunk);
@@ -198,6 +210,10 @@ pub(crate) fn load(path: &Path, origin: DVec3, control: &LoadControl) -> Result<
             break;
         }
     }
+
+    stats.color_depth = color_depth(max_channel);
+    fill_colors(&mut chunks, &rgb, stats.color_depth);
+    drop(rgb);
 
     stats.elapsed = start.elapsed();
 
@@ -240,6 +256,47 @@ fn build_octree(chunks: Vec<PointChunk>, control: &LoadControl) -> Result<(Point
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn chunk(len: usize) -> PointChunk {
+        PointChunk {
+            positions: vec![[0.0; 3]; len],
+            classes: vec![0; len],
+            colors: Vec::new(),
+            intensity: vec![0; len],
+        }
+    }
+
+    #[test]
+    fn colour_depth_comes_from_the_largest_channel() {
+        assert_eq!(color_depth(None), ColorDepth::None);
+        assert_eq!(color_depth(Some(255)), ColorDepth::Bits8);
+        assert_eq!(color_depth(Some(256)), ColorDepth::Bits16);
+    }
+
+    #[test]
+    fn a_high_channel_in_a_later_batch_sets_the_depth_of_every_batch() {
+        // The first batch alone looks 8-bit; the second shows the file is 16-bit.
+        let rgb = [[200, 100, 0], [65_535, 32_768, 256]];
+        let mut chunks = [chunk(1), chunk(1)];
+        let depth = color_depth(rgb.iter().flatten().copied().max());
+
+        fill_colors(&mut chunks, &rgb, depth);
+
+        assert_eq!(depth, ColorDepth::Bits16);
+        assert_eq!(chunks[0].colors, vec![[0, 0, 0, 255]]);
+        assert_eq!(chunks[1].colors, vec![[255, 128, 1, 255]]);
+    }
+
+    #[test]
+    fn eight_bit_colours_keep_their_values_and_missing_ones_are_grey() {
+        let mut chunks = [chunk(2)];
+        fill_colors(&mut chunks, &[[200, 255, 7], [1, 2, 3]], ColorDepth::Bits8);
+        assert_eq!(chunks[0].colors, vec![[200, 255, 7, 255], [1, 2, 3, 255]]);
+
+        let mut chunks = [chunk(3)];
+        fill_colors(&mut chunks, &[], ColorDepth::None);
+        assert_eq!(chunks[0].colors, vec![NO_COLOR; 3]);
+    }
 
     #[test]
     fn accepts_las_and_laz_in_any_case() {

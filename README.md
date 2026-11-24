@@ -1,5 +1,7 @@
 # Brume
 
+[![CI](https://github.com/jgespiga/brume/actions/workflows/ci.yml/badge.svg)](https://github.com/jgespiga/brume/actions/workflows/ci.yml)
+
 A LiDAR point cloud viewer written in Rust, built to render tens of millions
 of points interactively. Brume opens LAS/LAZ tiles, reports their attributes,
 and renders a shared scene with an orbit camera and per-frame level of detail.
@@ -375,6 +377,10 @@ cargo test
 cargo clippy --all-targets
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items
 ```
+
+[CI](.github/workflows/ci.yml) runs the format, Clippy, test and docs checks on
+every push to `main` and every pull request, with Clippy warnings treated as
+errors.
 
 ## Roadmap
 

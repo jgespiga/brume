@@ -1,5 +1,24 @@
-//! Offscreen point targets and the full-screen pass that composites them into
-//! egui's frame.
+//! Eye-dome lighting: shading point clouds from screen-space depth alone.
+//!
+//! Points have no normals, so ordinary lighting can't shade them, and a flat
+//! colour hides their shape. Eye-dome lighting (EDL, Boucheny 2009, as used by
+//! Potree and CloudCompare) darkens each pixel by how far it lies behind its
+//! neighbours on screen. Edges, steps and silhouettes in front of other points
+//! get dark outlines, and surfaces read as 3D, from the depth buffer only.
+//!
+//! ```text
+//! 8 neighbours at `radius` pixels        response = sum of max(0, d - d_n) / 8
+//!                                        shade    = exp(-response × strength × 300)
+//!   n   n   n
+//!   n   d   n      d   = log2 view depth of the centre
+//!   n   n   n      d_n = log2 view depth of a neighbour
+//! ```
+//!
+//! The depth is stored as log2 of the view depth. A step of the same proportion
+//! (a wall 1 m in front of a roof 10 m away, or 10 m in front of one 100 m away)
+//! gives the same difference, so the shading looks the same at any zoom. Empty
+//! neighbours (no point) and neighbours outside the view are skipped: as "very
+//! far" points they would add nothing to `max(0, d - d_n)` anyway.
 //!
 //! Points are not drawn straight into egui's render pass. In
 //! [`eframe::egui_wgpu::CallbackTrait::prepare`] they are drawn into textures owned by
@@ -32,23 +51,41 @@ pub const LOG_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
 /// Format of the depth buffer the points pass tests against.
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
+/// Eye-dome lighting settings, set in the UI.
+#[derive(Debug, Clone, Copy)]
+pub struct EdlSettings {
+    /// Off, the composite copies the colours unchanged.
+    pub enabled: bool,
+    /// Multiplies the darkening; 1 is Potree's default look.
+    pub strength: f32,
+    /// Distance of the 8 neighbours from the centre, in physical pixels. Larger
+    /// radii give thicker outlines.
+    pub radius_px: f32,
+}
+
 /// Uniform of the composite pass. Matches `Edl` in edl.wgsl.
 ///
 /// ```text
 /// Bytes    Field
 ///  0..8    origin of the view rectangle in the window, in physical pixels
-///  8..16   padding (vec4 alignment)
+///  8..12   neighbour radius in physical pixels
+/// 12..16   strength
 /// 16..32   background colour (gamma-space RGBA, as egui draws it)
+/// 32..36   enabled flag (1 shades, 0 copies)
+/// 36..48   padding to a multiple of 16
 /// ```
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct EdlUniform {
     origin_px: [f32; 2],
-    _pad: [f32; 2],
+    radius_px: f32,
+    strength: f32,
     background: [f32; 4],
+    enabled: u32,
+    _pad: [u32; 3],
 }
 
-const _: () = assert!(std::mem::size_of::<EdlUniform>() == 32);
+const _: () = assert!(std::mem::size_of::<EdlUniform>() == 48);
 
 /// The textures the points pass renders into, all the size of the view
 /// rectangle in physical pixels, and the bind group the composite reads them with.
@@ -228,13 +265,22 @@ impl EdlPass {
         });
     }
 
-    /// Writes this frame's uniform: where the view sits in the window, and the
-    /// background drawn where no point is.
-    pub fn write_uniform(&self, queue: &wgpu::Queue, view: PixelRect, background: [f32; 4]) {
+    /// Writes this frame's uniform: where the view sits in the window, the
+    /// background drawn where no point is, and the shading settings.
+    pub fn write_uniform(
+        &self,
+        queue: &wgpu::Queue,
+        view: PixelRect,
+        background: [f32; 4],
+        settings: EdlSettings,
+    ) {
         let uniform = EdlUniform {
             origin_px: view.origin.map(|value| value as f32),
-            _pad: [0.0; 2],
+            radius_px: settings.radius_px,
+            strength: settings.strength,
             background,
+            enabled: u32::from(settings.enabled),
+            _pad: [0; 3],
         };
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&uniform));
     }

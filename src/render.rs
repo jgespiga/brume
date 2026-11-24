@@ -48,7 +48,7 @@ use eframe::wgpu::{BindGroup, Buffer};
 use glam::Mat4;
 
 use crate::cloud::{PointChunk, Tile};
-use crate::edl::{self, EdlPass};
+use crate::edl::{self, EdlPass, EdlSettings};
 use crate::octree::{Octree, OctreeParams};
 use crate::report::{DEPTH_PALETTE_LEN, class_color, depth_color};
 use crate::vnt::VisibleNode;
@@ -660,6 +660,8 @@ pub struct PointsCallback {
     pub view: PixelRect,
     /// Gamma-space RGBA of the panel, drawn where no point is.
     pub background: [f32; 4],
+    /// Eye-dome lighting applied when compositing, radius in physical pixels.
+    pub edl: EdlSettings,
     /// Fixed or adaptive point size and its settings.
     pub point_sizing: PointSizing,
     /// `viewport_height_px / (2 tan(fov_y / 2))`, for adaptive sizes.
@@ -719,7 +721,7 @@ impl egui_wgpu::CallbackTrait for PointsCallback {
         queue.write_buffer(&renderer.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
         renderer
             .edl
-            .write_uniform(queue, self.view, self.background);
+            .write_uniform(queue, self.view, self.background, self.edl);
 
         // All tiles' trees go into one buffer; each tile's parameters record
         // where its tree starts.

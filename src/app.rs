@@ -41,11 +41,12 @@ use glam::{Mat4, Vec2, Vec3};
 
 use crate::{
     camera::{FOV_Y, OrbitCamera, project_to_screen},
+    edl::EdlSettings,
     loader::{LoadControl, is_lidar_file},
     lod::{LodParams, Selection, draw_ranges, frustum_corners},
     octree::{Node, Octree, OctreeParams, OctreeStats},
     perf::FrameTimes,
-    render::{ColorMode, PointRenderer, PointSizeMode, PointSizing, PointsCallback},
+    render::{ColorMode, PixelRect, PointRenderer, PointSizeMode, PointSizing, PointsCallback},
     report::depth_color,
     scene::{LoadPlan, LoadedScene, load_scene},
     vnt::{self, VisibleNode},
@@ -162,6 +163,9 @@ enum FileAction {
 struct ViewSettings {
     /// Fixed or adaptive point size, passed to the shader.
     point_sizing: PointSizing,
+    /// Eye-dome lighting, with the radius in egui points (scaled to physical
+    /// pixels when the frame is drawn).
+    edl: EdlSettings,
     /// Attribute-to-colour mapping chosen by the user.
     color_mode: ColorMode,
     /// Recent intervals between UI calls during continuous repaint.
@@ -742,11 +746,15 @@ impl Scene {
             if rect.width() > 0.0 && rect.height() > 0.0 {
                 let view_proj = self.camera.view_proj(rect.width() / rect.height());
 
+                // Rounded exactly as egui_wgpu rounds the callback's viewport, so
+                // the offscreen targets match it pixel for pixel.
                 let pixels_per_point = ui.ctx().pixels_per_point();
-                let viewport = [
-                    rect.width() * pixels_per_point,
-                    rect.height() * pixels_per_point,
-                ];
+                let pixels = PixelRect::from_points(
+                    [rect.min.x, rect.min.y],
+                    [rect.max.x, rect.max.y],
+                    pixels_per_point,
+                );
+                let viewport = pixels.size.map(|value| value as f32);
                 view.viewport_px = Some(viewport);
 
                 let selection = self.frame_selection(view_proj, viewport[1], view);
@@ -759,7 +767,12 @@ impl Scene {
                     rect,
                     PointsCallback {
                         view_proj,
-                        viewport,
+                        view: pixels,
+                        background: ui.visuals().panel_fill.to_normalized_gamma_f32(),
+                        edl: EdlSettings {
+                            radius_px: view.edl.radius_px * pixels_per_point,
+                            ..view.edl
+                        },
                         point_sizing: view.point_sizing,
                         projection_factor: viewport[1] / (2.0 * (FOV_Y * 0.5).tan()),
                         color_mode: view.color_mode,
@@ -890,6 +903,11 @@ impl ViewSettings {
                 max_px: 16.0,
                 round: true,
             },
+            edl: EdlSettings {
+                enabled: true,
+                strength: 1.0,
+                radius_px: 1.5,
+            },
             color_mode: ColorMode::Rgb,
             frame_times: FrameTimes::new(FRAME_WINDOW),
             continuous_repaint: false,
@@ -923,8 +941,9 @@ impl ViewSettings {
         ui.ctx().request_repaint();
     }
 
-    /// Point size (fixed, or adaptive with its scale and clamp) and colour mode.
-    /// With "Octree depth" or "LOD level", also a legend for depths 0 to `deepest`.
+    /// Point size (fixed, or adaptive with its scale and clamp), eye-dome lighting
+    /// and colour mode. With "Octree depth" or "LOD level", also a legend for
+    /// depths 0 to `deepest`.
     fn controls_ui(&mut self, ui: &mut egui::Ui, deepest: u8) {
         ui.horizontal(|ui| {
             ui.label("Point size");
@@ -946,6 +965,13 @@ impl ViewSettings {
             }
         }
         ui.checkbox(&mut sizing.round, "Round points");
+
+        let edl = &mut self.edl;
+        ui.checkbox(&mut edl.enabled, "Eye-dome lighting");
+        if edl.enabled {
+            ui.add(egui::Slider::new(&mut edl.strength, 0.1..=3.0).text("Strength"));
+            ui.add(egui::Slider::new(&mut edl.radius_px, 1.0..=4.0).text("Radius (px)"));
+        }
 
         ui.separator();
 

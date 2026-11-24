@@ -11,6 +11,7 @@ The implementation demonstrates:
 - [An octree with grid sampling and breadth-first point storage](src/octree.rs).
 - [Per-frame level of detail with frustum culling and a point budget](src/lod.rs).
 - [Adaptive point size from a visible node tree walked on the GPU](src/vnt.rs).
+- [Eye-dome lighting in a two-pass renderer inside an egui paint callback](src/edl.rs).
 - [Instanced rendering on wgpu with packed attributes](src/render.rs) and
   [screen-space point squares in WGSL](src/points.wgsl).
 
@@ -303,16 +304,45 @@ Packed u32
 ```
 
 The callback binds each selected tile once and issues one instanced draw
-per merged point range. [The shader](src/points.wgsl) expands each point
-into a screen-space square using a four-vertex triangle strip. Its colour
-modes use file RGB, height on viridis, the classification palette, intensity
-as grey, or the cyclic octree-depth palette.
+per merged point range, into offscreen targets (see eye-dome lighting
+below). [The shader](src/points.wgsl) expands each point into a
+screen-space square using a four-vertex triangle strip. Its colour modes use
+file RGB, height on viridis, the classification palette, intensity as grey,
+or the cyclic octree-depth palette for the octree depth or the LOD level.
 
 ```text
 point instance -> projected centre -> screen-space square -> depth test
-                                             |
-                                        point colour
+                                             |                   |
+                                        point colour       colour + log2 depth
 ```
+
+### [Eye-dome lighting](src/edl.rs)
+
+Points have no normals, so ordinary lighting can't shade them. Eye-dome
+lighting shades from screen-space depth alone: each pixel darkens by how far
+it lies behind its 8 neighbours, a few pixels away. Edges, steps and
+silhouettes in front of other points get dark outlines, and roofs, trees and
+terrain read as 3D.
+
+The depth is stored as log2 of the view depth, so a step of the same
+proportion gives the same difference near or far, and the shading looks the
+same at any zoom.
+
+It takes two passes, both inside the egui paint callback. Its `prepare`
+step, which runs on egui's command encoder before egui's own render pass,
+draws the points into offscreen colour, log depth and depth textures. Its
+`paint` step draws one full-screen triangle into egui's pass that reads
+those textures and writes the shaded colour. The offscreen textures are
+recreated when the view changes size, and Brume no longer asks eframe for a
+depth buffer.
+
+```text
+prepare: points -> colour + log2 depth + depth (offscreen, view size)
+paint:   full-screen triangle -> 8 neighbour depths -> shaded colour -> egui
+```
+
+*Strength* scales the darkening and *Radius* sets the neighbour distance,
+which thickens the outlines.
 
 ### [Reports and frame timing](src/report.rs)
 
